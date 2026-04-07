@@ -4,7 +4,7 @@ An agent-driven guided code review tool for Neovim and [OpenCode](https://openco
 
 ## How it works
 
-The plugin connects an OpenCode agent to Neovim's [diffview.nvim](https://github.com/sindrets/diffview.nvim) via Neovim's built-in RPC socket. The agent can open diffs, navigate between files, and query the current review state — all while the user stays in their editor.
+The plugin connects an OpenCode agent to Neovim's [diffview.nvim](https://github.com/sindrets/diffview.nvim) via Neovim's built-in RPC socket. The agent can open diffs, navigate between files, and query the current review state — all while the user interacts via the OpenCode chat.
 
 ```
 ┌────────────────────────────┬──────────────────────┐
@@ -69,7 +69,7 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
 
 ```lua
 {
-  "your-username/nvim-diff-review-opencode-plugin",
+  "talldan/nvim-diff-review-opencode-plugin",
   dependencies = { "sindrets/diffview.nvim" },
   config = function()
     require("diff-review").setup()
