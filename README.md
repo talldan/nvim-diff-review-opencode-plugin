@@ -95,15 +95,29 @@ Restart OpenCode to load the plugin. The `diff_review` tool will be available to
 
 ### 3. Neovim RPC socket
 
-The tool communicates with Neovim via its RPC socket. You need to:
+The tool communicates with Neovim via its RPC socket. In most cases, **no configuration is needed** — the tool auto-discovers running Neovim instances.
 
-1. Start Neovim with a listen address:
-   ```bash
-   export NVIM_SOCKET=/tmp/nvim.sock
-   nvim --listen $NVIM_SOCKET
-   ```
+#### Auto-discovery (default)
 
-2. Make sure `NVIM_SOCKET` is set in the environment where OpenCode runs.
+The tool automatically finds Neovim by:
+
+1. Checking the `NVIM_SOCKET` environment variable (if set, always used)
+2. Scanning for Neovim sockets in standard locations (`$TMPDIR` and `/tmp`)
+3. Preferring the Neovim instance whose working directory matches the current project
+4. Falling back to the first live Neovim instance found
+
+This means if you just run `nvim` in your project directory, OpenCode will find it automatically.
+
+#### Explicit configuration (optional)
+
+If auto-discovery doesn't work for your setup (e.g., multiple Neovim instances in the same directory), you can set the socket path explicitly:
+
+```bash
+export NVIM_SOCKET=/tmp/nvim.sock
+nvim --listen $NVIM_SOCKET
+```
+
+Make sure `NVIM_SOCKET` is set in the environment where OpenCode runs.
 
 If you use [CMUX](https://cmux.com), you can set this in your workspace configuration so both Neovim and OpenCode share the socket path automatically.
 
@@ -133,6 +147,7 @@ Key design decisions:
 - **Wrap-around prevention**: diffview.nvim wraps from the last file to the first (and vice versa) when navigating. The tool detects this by comparing indices before and after navigation, and undoes the wrap if detected.
 - **Buffer cleanup on close**: diffview.nvim intentionally keeps local file buffers open after closing (so you can continue editing). The plugin tracks which buffers existed before the review and removes any new ones on close — unless they have unsaved edits.
 - **Small delays after navigation**: 200-500ms sleeps after diffview commands to let the UI update before querying state. Without this, the state query can return stale data.
+- **Socket auto-discovery**: When `NVIM_SOCKET` is not set, the tool scans `$TMPDIR/nvim.$USER/` and `/tmp` for Neovim socket files, verifies each is live, and uses `lsof` to match the Neovim process's working directory against the current project. This allows zero-configuration usage in ad-hoc terminals — just run `nvim` and OpenCode will find it.
 
 ### Review workflow instructions
 
