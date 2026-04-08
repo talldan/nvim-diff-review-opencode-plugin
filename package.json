@@ -1,6 +1,6 @@
 {
   "name": "opencode-nvim-diff-review",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Agent-driven guided code review for Neovim + OpenCode",
   "main": "opencode-plugin/index.ts",
   "keywords": [
