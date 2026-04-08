@@ -195,15 +195,17 @@ function DiffviewHunks(ref)
   return vim.json.encode(hunks)
 end
 
---- Navigate diffview to a specific file and line number.
+--- Navigate diffview to a specific file and hunk.
 ---
 --- Finds the file in diffview's file list, switches to it if needed,
---- then moves the cursor to the specified line in the right-hand (new) buffer.
+--- positions the cursor at the hunk, and folds all other regions so only
+--- the target hunk (with a few context lines) is visible.
 ---
 --- @param file string Repo-relative file path
---- @param line number Line number to jump to (in the new version of the file)
+--- @param line_or_hunk number|table Either a line number or a hunk spec table:
+---                                   { new_start, new_count, old_start, old_count }
 --- @return string JSON-encoded result: { ok: true } or { error: string }
-function DiffviewGoTo(file, line)
+function DiffviewGoTo(file, line_or_hunk)
   local ok, lib = pcall(require, "diffview.lib")
   if not ok then
     return vim.json.encode({ error = "diffview.nvim not loaded" })
@@ -231,16 +233,25 @@ function DiffviewGoTo(file, line)
     return vim.json.encode({ error = "File not found in diffview: " .. file })
   end
 
-  -- Store the target so the autocmd can position the cursor after diffview
-  -- finishes its async file loading (which resets cursor to line 1).
-  pending_goto = { file = file, line = line }
+  -- Store the target so the autocmd can position the cursor and set up folds
+  -- after diffview finishes its async file loading.
+  local hunk_spec = type(line_or_hunk) == "table" and line_or_hunk or nil
+  local target_line = hunk_spec
+    and (hunk_spec.new_start > 0 and hunk_spec.new_start or 1)
+    or (type(line_or_hunk) == "number" and line_or_hunk or 1)
+
+  pending_goto = {
+    file = file,
+    line = target_line,
+    hunk = hunk_spec,
+  }
 
   -- Switch to the target file if it's not already the current one
   local cur_file = panel.cur_file
   if not cur_file or cur_file.path ~= file then
     view:set_file(target)
   else
-    -- Already on the right file — apply cursor position directly
+    -- Already on the right file — apply directly
     M._apply_pending_goto()
   end
 
@@ -258,13 +269,17 @@ function M.on_view_opened(view)
   end
 end
 
---- Apply a pending cursor position after diffview has finished loading a file.
---- Called from the DiffviewDiffBufWinEnter autocmd and from DiffviewGoTo when
---- the file is already displayed.
+--- Number of context lines to show above and below a focused hunk.
+local HUNK_CONTEXT = 3
+
+--- Apply a pending cursor position and hunk focus after diffview has finished
+--- loading a file. Called from the DiffviewDiffBufWinEnter autocmd and from
+--- DiffviewGoTo when the file is already displayed.
 function M._apply_pending_goto()
   if not pending_goto then return end
 
   local target_line = pending_goto.line
+  local hunk = pending_goto.hunk
   pending_goto = nil
 
   -- Small delay to ensure diffview's own cursor positioning (which resets to
@@ -276,24 +291,106 @@ function M._apply_pending_goto()
     local view = lib.get_current_view()
     if not view then return end
 
+    local layout = view.cur_layout
+    if not layout then return end
+
     -- Get the main window (right-hand / "b" side in a 2-way diff)
-    local main_win = view.cur_layout:get_main_win()
+    local main_win = layout:get_main_win()
     if not main_win or not main_win.id or not vim.api.nvim_win_is_valid(main_win.id) then
       return
     end
 
-    local file = main_win.file
-    if not file or not file.bufnr or not vim.api.nvim_buf_is_loaded(file.bufnr) then
+    local main_file = main_win.file
+    if not main_file or not main_file.bufnr or not vim.api.nvim_buf_is_loaded(main_file.bufnr) then
       return
     end
 
-    -- Clamp line to buffer length
-    local max_line = vim.api.nvim_buf_line_count(file.bufnr)
+    -- Position cursor at the hunk
+    local max_line = vim.api.nvim_buf_line_count(main_file.bufnr)
     local line = math.min(math.max(target_line or 1, 1), max_line)
     vim.api.nvim_win_set_cursor(main_win.id, { line, 0 })
     vim.api.nvim_set_current_win(main_win.id)
+
+    -- Set up hunk-focus folds if we have hunk boundaries
+    if hunk then
+      M._apply_hunk_focus(view, hunk)
+    end
+
     vim.cmd("normal! zz")
   end, 50)
+end
+
+--- Create folds that hide everything except the target hunk and a few
+--- context lines around it. Switches both diff windows to foldmethod=manual.
+---
+--- @param view table The current DiffView
+--- @param hunk table Hunk spec: { new_start, new_count, old_start, old_count }
+function M._apply_hunk_focus(view, hunk)
+  local layout = view.cur_layout
+  if not layout then return end
+
+  -- Compute the visible range for each side (old = "a", new = "b").
+  -- layout.a and layout.b are Window objects with .id and .file properties.
+  -- A hunk with count=0 means pure insertion/deletion — show context around
+  -- the start line instead.
+  local sides = {}
+
+  -- "b" side (new/right) — uses new_start/new_count
+  if layout.b and layout.b.file and layout.b.file.bufnr
+    and vim.api.nvim_buf_is_loaded(layout.b.file.bufnr)
+  then
+    local lcount = vim.api.nvim_buf_line_count(layout.b.file.bufnr)
+    local hunk_first = hunk.new_start > 0 and hunk.new_start or 1
+    local hunk_last = hunk.new_count > 0 and (hunk.new_start + hunk.new_count - 1) or hunk_first
+    table.insert(sides, {
+      win_id = layout.b.id,
+      lcount = lcount,
+      hunk_first = hunk_first,
+      hunk_last = hunk_last,
+    })
+  end
+
+  -- "a" side (old/left) — uses old_start/old_count
+  if layout.a and layout.a.file and layout.a.file.bufnr
+    and vim.api.nvim_buf_is_loaded(layout.a.file.bufnr)
+  then
+    local lcount = vim.api.nvim_buf_line_count(layout.a.file.bufnr)
+    local hunk_first = hunk.old_start > 0 and hunk.old_start or 1
+    local hunk_last = hunk.old_count > 0 and (hunk.old_start + hunk.old_count - 1) or hunk_first
+    table.insert(sides, {
+      win_id = layout.a.id,
+      lcount = lcount,
+      hunk_first = hunk_first,
+      hunk_last = hunk_last,
+    })
+  end
+
+  for _, side in ipairs(sides) do
+    if vim.api.nvim_win_is_valid(side.win_id) then
+      vim.api.nvim_win_call(side.win_id, function()
+        -- Switch to manual folds so we have full control
+        vim.wo.foldmethod = "manual"
+        vim.wo.foldenable = true
+
+        -- Remove all existing folds
+        pcall(vim.cmd, "normal! zE")
+
+        -- Visible range: hunk lines + context
+        local vis_first = math.max(1, side.hunk_first - HUNK_CONTEXT)
+        local vis_last = math.min(side.lcount, side.hunk_last + HUNK_CONTEXT)
+
+        -- Create fold above the visible range
+        if vis_first > 1 then
+          vim.cmd(string.format("1,%dfold", vis_first - 1))
+        end
+
+        -- Create fold below the visible range
+        if vis_last < side.lcount then
+          vim.cmd(string.format("%d,%dfold", vis_last + 1, side.lcount))
+        end
+      end)
+    end
+  end
 end
 
 --- Diffview hook: called when a diff view is closed.

@@ -283,15 +283,15 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
 
           const goToHunk = async (item: HunkItem): Promise<void> => {
             const file = item.file.replace(/"/g, '\\"')
-            // Navigate to the new_start line (the line in the new version)
-            const line = item.new_start > 0 ? item.new_start : 1
+            // Pass hunk boundaries so Lua can set up folds to focus on this hunk
+            const hunkSpec = `{new_start=${item.new_start},new_count=${item.new_count},old_start=${item.old_start},old_count=${item.old_count}}`
             const raw = await nvimExpr(
-              `luaeval("DiffviewGoTo('${file}', ${line})")`
+              `luaeval("DiffviewGoTo('${file}', ${hunkSpec})")`
             )
             const result = JSON.parse(raw.trim())
             if (result.error) throw new Error(result.error)
-            // Give diffview time to switch files and the Lua polling to
-            // position the cursor (Lua side retries for up to 1s)
+            // Give diffview time to switch files and the Lua side to
+            // position cursor and set up folds
             await Bun.sleep(500)
           }
 
