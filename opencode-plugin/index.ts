@@ -16,6 +16,77 @@ interface DiffviewState {
   error?: string
 }
 
+/**
+ * Discover a Neovim RPC socket when NVIM_SOCKET is not explicitly set.
+ *
+ * Strategy:
+ * 1. Check NVIM_SOCKET env var (always wins)
+ * 2. Scan for socket files in known locations
+ * 3. Verify each is live by attempting a connection
+ * 4. Prefer the Neovim instance whose cwd matches ours (same project)
+ * 5. Fall back to the first live socket found
+ */
+const discoverNvimSocket = async (): Promise<string | null> => {
+  // 1. Explicit env var — skip discovery entirely
+  if (process.env.NVIM_SOCKET) return process.env.NVIM_SOCKET
+
+  // 2. Scan for socket files
+  const tmpdir = process.env.TMPDIR || "/tmp"
+  const user = process.env.USER || "unknown"
+  let socketPaths: string[] = []
+
+  try {
+    const output =
+      await Bun.$`find -L ${tmpdir}/nvim.${user} /tmp -maxdepth 4 -type s -name "nvim*" 2>/dev/null`.text()
+    socketPaths = output.trim().split("\n").filter(Boolean)
+  } catch {}
+
+  if (socketPaths.length === 0) return null
+
+  // 3 & 4. Check each socket — prefer cwd match, fall back to first live one
+  const ourCwd = process.cwd()
+  let fallback: string | null = null
+
+  for (const socketPath of socketPaths) {
+    try {
+      // Verify socket is live with a simple expression
+      await Bun.$`nvim --headless --server ${socketPath} --remote-expr "1+1"`.text()
+
+      // Try to get the PID from the socket filename (default sockets: nvim.<pid>.0)
+      let pid: string | undefined
+      const pidFromName = socketPath.match(/nvim\.(\d+)\.\d+$/)
+      if (pidFromName) {
+        pid = pidFromName[1]
+      } else {
+        // For --listen sockets (no PID in filename), find the owning process
+        try {
+          const lsof = await Bun.$`lsof ${socketPath} 2>/dev/null`.text()
+          const pidMatch = lsof.match(/nvim\s+(\d+)/)
+          if (pidMatch) pid = pidMatch[1]
+        } catch {}
+      }
+
+      // Get the cwd of the Neovim process and compare with ours
+      if (pid) {
+        try {
+          const lsof = await Bun.$`lsof -p ${pid} -Fn 2>/dev/null`.text()
+          const cwdMatch = lsof.match(/fcwd\nn(.+)/)
+          if (cwdMatch && cwdMatch[1] === ourCwd) {
+            return socketPath // Exact cwd match — this is our Neovim
+          }
+        } catch {}
+      }
+
+      // Remember the first live socket as fallback
+      if (!fallback) fallback = socketPath
+    } catch {
+      // Socket not responsive — stale socket from a crashed Neovim, skip it
+    }
+  }
+
+  return fallback
+}
+
 export const DiffReviewPlugin: Plugin = async (ctx) => {
   return {
     tool: {
@@ -79,14 +150,16 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
             ),
         },
         async execute(args, context) {
-          const socket = process.env.NVIM_SOCKET
+          const socket = await discoverNvimSocket()
           if (!socket) {
-            return "NVIM_SOCKET environment variable is not set. " +
-              "Make sure Neovim is running with --listen and NVIM_SOCKET is exported.\n\n" +
+            return "Could not find a running Neovim instance.\n\n" +
+              "The tool looks for Neovim in this order:\n" +
+              "1. NVIM_SOCKET environment variable (if set)\n" +
+              "2. Neovim instances whose working directory matches this project\n" +
+              "3. Any running Neovim instance\n\n" +
               "Quick setup:\n" +
               "  export NVIM_SOCKET=/tmp/nvim.sock\n" +
-              "  nvim --listen $NVIM_SOCKET\n\n" +
-              "If using CMUX, the workspace command sets this automatically."
+              "  nvim --listen $NVIM_SOCKET"
           }
 
           const nvimExpr = (expr: string) =>
