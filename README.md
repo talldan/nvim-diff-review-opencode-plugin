@@ -155,7 +155,19 @@ The review operates at the **hunk level** rather than the file level. This means
 - Small files with a single change are naturally one review item
 - The agent can filter out trivial hunks (e.g., import reordering) from the review
 
-Hunks are retrieved by running `git diff -U0` and parsing the output with diffview.nvim's built-in unified diff parser (`diffview.vcs.utils.parse_diff`). The `-U0` flag produces zero-context hunks, giving exact change boundaries.
+Hunks are retrieved by running `git diff -U0` and parsing the output with diffview.nvim's built-in unified diff parser (`diffview.vcs.utils.parse_diff`). The `-U0` flag produces zero-context hunks, giving exact change boundaries. (Note: `-U0` omits the count in hunk headers when it's 1, e.g., `@@ -134 +134,4 @@`. The plugin normalizes these to the `N,M` form before parsing.)
+
+### Hunk-focus folding
+
+When navigating to a hunk, the plugin folds all other regions of the file so only the target hunk is visible — similar to `git add -p`. This is achieved by:
+
+1. Switching both diff windows from `foldmethod=diff` to `foldmethod=manual`
+2. Creating two manual folds: one above the hunk and one below
+3. Showing 5 lines of context above and below the hunk
+
+The fold highlight is overridden with a custom `DiffviewDiffFoldedReview` highlight group (linked to `Comment` by default) so fold lines look like muted separators rather than diff modifications. Users can override this highlight group in their colorscheme.
+
+Line numbers are switched to absolute (`number`, no `relativenumber`) during hunk focus so they match the line ranges shown in the hunk headers.
 
 ### Review queue
 
@@ -172,7 +184,7 @@ The Lua (Neovim) side is stateless — it provides functions to query hunks and 
 - **State queries via global Lua functions**: `DiffviewState()`, `DiffviewHunks()`, and `DiffviewGoTo()` are registered as globals so they can be called via `luaeval()` from Neovim's `--remote-expr` without needing the module require path.
 - **Wrap-around prevention**: The tool checks queue bounds before navigating and refuses to advance past the first/last item.
 - **Buffer cleanup on close**: diffview.nvim intentionally keeps local file buffers open after closing (so you can continue editing). The plugin tracks which buffers existed before the review and removes any new ones on close — unless they have unsaved edits.
-- **Small delays after navigation**: 300ms sleeps after diffview commands to let the UI update before querying state. Without this, the state query can return stale data.
+- **Async cursor positioning**: `DiffviewGoTo` stores a pending target and applies it via a `DiffviewDiffBufWinEnter` autocmd + `vim.defer_fn`. This ensures the cursor is positioned after diffview's async `set_file` completes (which resets cursor to line 1 on `file_open_new`).
 - **Socket auto-discovery**: When `NVIM_SOCKET` is not set, the tool scans `$TMPDIR/nvim.$USER/` and `/tmp` for Neovim socket files, verifies each is live, and uses `lsof` to match the Neovim process's working directory against the current project. This allows zero-configuration usage in ad-hoc terminals — just run `nvim` and OpenCode will find it.
 
 ### Review workflow instructions
@@ -196,10 +208,6 @@ Show surrounding code context around the current hunk. Useful when the agent or 
 ### Accept/reject per-hunk
 
 Allow the user to accept or reject individual hunks from the diff view, similar to `git add -p`. This would integrate with diffview.nvim's staging capabilities.
-
-### Logical ordering
-
-Instead of the agent deciding order ad-hoc, build smarter ordering heuristics — e.g., analyzing import graphs to automatically determine dependency order between changed files.
 
 ### OpenCode session diff integration
 
