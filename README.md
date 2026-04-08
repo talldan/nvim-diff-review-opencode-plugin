@@ -43,9 +43,9 @@ A Lua module that:
 - Registers a global `DiffviewState()` function queryable via Neovim's RPC socket
 - Provides diffview.nvim hooks that clean up buffers when the diff view is closed (so reviewed files don't linger as open tabs)
 
-### 2. OpenCode custom tool (`opencode-tool/diff-review.ts`)
+### 2. OpenCode plugin (`opencode-plugin/index.ts`)
 
-A TypeScript tool that the AI agent uses to control the diff view. Actions:
+An OpenCode plugin that registers a `diff_review` tool the AI agent uses to control the diff view. Actions:
 
 | Action | Description |
 |--------|-------------|
@@ -63,7 +63,7 @@ A TypeScript tool that the AI agent uses to control the diff view. Actions:
 
 ## Installation
 
-### Neovim plugin
+### 1. Neovim plugin
 
 Using [lazy.nvim](https://github.com/folke/lazy.nvim):
 
@@ -79,23 +79,21 @@ Using [lazy.nvim](https://github.com/folke/lazy.nvim):
 
 This also installs diffview.nvim as a dependency if you don't already have it. You can configure diffview.nvim separately — the plugin merges its hooks with any existing diffview hooks you have.
 
-### OpenCode custom tool
+### 2. OpenCode plugin
 
-Copy the tool file to your OpenCode tools directory:
+Add the plugin to your `opencode.json` configuration:
 
-```bash
-cp opencode-tool/diff-review.ts ~/.config/opencode/tools/diff-review.ts
+```json
+{
+  "plugin": ["github:talldan/nvim-diff-review-opencode-plugin"]
+}
 ```
 
-Or for a project-specific installation:
+This can go in your global config (`~/.config/opencode/opencode.json`) or a project-level config (`opencode.json` in your project root).
 
-```bash
-cp opencode-tool/diff-review.ts .opencode/tools/diff-review.ts
-```
+Restart OpenCode to load the plugin. The `diff_review` tool will be available to the AI agent automatically.
 
-Restart OpenCode to load the tool.
-
-### Neovim RPC socket
+### 3. Neovim RPC socket
 
 The tool communicates with Neovim via its RPC socket. You need to:
 
@@ -168,7 +166,3 @@ The agent could jump to specific line ranges within a diff to highlight the key 
 ### OpenCode session diff integration
 
 Instead of using `git diff` to determine changed files, use OpenCode's `/session/:id/diff` API endpoint to get exactly which files the agent modified in the current session. This would avoid showing unrelated uncommitted changes.
-
-### Packaging as an OpenCode plugin
-
-Currently the OpenCode tool is a standalone TypeScript file that must be copied manually. It could be packaged as a proper [OpenCode plugin](https://opencode.ai/docs/plugins/) for easier distribution and automatic updates.
