@@ -120,7 +120,8 @@ const statusLabel = (status: string | undefined): string =>
 const formatHunkPosition = (): string => {
   if (reviewQueue.length === 0) return "No review in progress."
   const item = reviewQueue[reviewPosition]
-  return `Reviewing: ${item.file} (${statusLabel(item.status)}) ${item.header} — item ${reviewPosition + 1} of ${reviewQueue.length}.`
+  const fileCount = new Set(reviewQueue.map(h => h.file)).size
+  return `Reviewing: ${item.file} (${statusLabel(item.status)}) ${item.header} — item ${reviewPosition + 1} of ${reviewQueue.length} across ${fileCount} file${fileCount === 1 ? "" : "s"}.`
 }
 
 /**

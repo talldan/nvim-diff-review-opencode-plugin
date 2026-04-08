@@ -270,7 +270,9 @@ function M.on_view_opened(view)
 end
 
 --- Number of context lines to show above and below a focused hunk.
-local HUNK_CONTEXT = 3
+--- This provides enough surrounding code to understand the change without
+--- overwhelming the view with unrelated code.
+local HUNK_CONTEXT = 5
 
 --- Apply a pending cursor position and hunk focus after diffview has finished
 --- loading a file. Called from the DiffviewDiffBufWinEnter autocmd and from
@@ -372,6 +374,20 @@ function M._apply_hunk_focus(view, hunk)
         vim.wo.foldmethod = "manual"
         vim.wo.foldenable = true
 
+        -- Show absolute line numbers so the user can correlate with the
+        -- hunk header line ranges (e.g. @@ -273,1 +273,3 @@)
+        vim.wo.number = true
+        vim.wo.relativenumber = false
+
+        -- Override the Folded highlight in this window so fold lines don't
+        -- look like diff modifications. Uses winhl to scope it to this window.
+        local existing_winhl = vim.wo.winhl or ""
+        if not existing_winhl:match("Folded:") then
+          vim.wo.winhl = existing_winhl
+            .. (existing_winhl ~= "" and "," or "")
+            .. "Folded:DiffviewDiffFoldedReview"
+        end
+
         -- Remove all existing folds
         pcall(vim.cmd, "normal! zE")
 
@@ -436,6 +452,11 @@ function M.setup(opts)
   _G.DiffviewState = DiffviewState
   _G.DiffviewHunks = DiffviewHunks
   _G.DiffviewGoTo = DiffviewGoTo
+
+  -- Define a neutral highlight for fold lines in hunk-focus mode.
+  -- Links to Comment by default so folds look like muted separators
+  -- rather than diff modifications. Users can override this.
+  vim.api.nvim_set_hl(0, "DiffviewDiffFoldedReview", { link = "Comment", default = true })
 
   -- Listen for diffview's DiffviewDiffBufWinEnter autocmd to apply pending
   -- cursor positions after async file loading completes.
