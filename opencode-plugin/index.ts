@@ -105,12 +105,17 @@ const discoverNvimSocket = async (): Promise<string | null> => {
 
 // --- Helpers ---
 
+const STATUS_LABELS: Record<string, string> = {
+  M: "modified",
+  A: "added",
+  D: "deleted",
+  R: "renamed",
+  C: "copied",
+  T: "type-changed",
+}
+
 const statusLabel = (status: string | undefined): string =>
-  status === "M" ? "modified" :
-  status === "A" ? "added" :
-  status === "D" ? "deleted" :
-  status === "R" ? "renamed" :
-  status ?? "changed"
+  (status && STATUS_LABELS[status]) ?? "changed"
 
 const formatHunkPosition = (): string => {
   if (reviewQueue.length === 0) return "No review in progress."
@@ -120,7 +125,7 @@ const formatHunkPosition = (): string => {
 
 /**
  * Match an order item from the agent to a hunk in the available hunks list.
- * Identity is {file, old_start, new_start}.
+ * A hunk is uniquely identified by {file, old_start, old_count, new_start, new_count}.
  */
 const findHunk = (
   hunks: HunkItem[],
@@ -134,6 +139,26 @@ const findHunk = (
       h.new_start === orderItem.new_start &&
       h.new_count === orderItem.new_count
   )
+
+/**
+ * Format a summary of the files covered in the review queue.
+ */
+const formatQueueSummary = (queue: HunkItem[]): string => {
+  const fileGroups = new Map<string, { status: string; count: number }>()
+  for (const item of queue) {
+    const existing = fileGroups.get(item.file)
+    if (existing) {
+      existing.count++
+    } else {
+      fileGroups.set(item.file, { status: item.status, count: 1 })
+    }
+  }
+  const lines = Array.from(fileGroups.entries()).map(
+    ([file, { status, count }]) =>
+      `  ${file} (${statusLabel(status)}) — ${count} hunk${count === 1 ? "" : "s"}`
+  )
+  return `\nFiles in review:\n${lines.join("\n")}`
+}
 
 // --- Plugin ---
 
@@ -265,8 +290,9 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
             )
             const result = JSON.parse(raw.trim())
             if (result.error) throw new Error(result.error)
-            // Give diffview time to switch files and position the cursor
-            await Bun.sleep(300)
+            // Give diffview time to switch files and the Lua polling to
+            // position the cursor (Lua side retries for up to 1s)
+            await Bun.sleep(500)
           }
 
           try {
@@ -353,7 +379,8 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
 
                 return `Started review with ${reviewQueue.length} item${reviewQueue.length === 1 ? "" : "s"}` +
                   (ref ? ` (comparing against ${ref})` : " (uncommitted changes vs HEAD)") +
-                  `. ${formatHunkPosition()}`
+                  `. ${formatHunkPosition()}` +
+                  formatQueueSummary(reviewQueue)
               }
 
               case "next": {

@@ -23,6 +23,13 @@ local M = {}
 --- Used by the cleanup hooks to avoid removing buffers the user had open.
 local pre_diffview_bufs = {}
 
+--- Pending cursor position to set after diffview finishes opening a file.
+--- DiffviewGoTo stores the target here, and the autocmd on DiffviewDiffBufWinEnter
+--- applies it. This avoids a race with diffview's async file loading which resets
+--- the cursor to line 1 after opening.
+--- @type { file: string, line: number }?
+local pending_goto = nil
+
 --- Query the current diffview state.
 --- Returns a JSON string with:
 ---   open: boolean          - whether diffview is active
@@ -131,11 +138,32 @@ function DiffviewHunks(ref)
   end
   local diff_lines = vim.fn.systemlist(diff_cmd)
   if vim.v.shell_error ~= 0 then
-    return vim.json.encode({ error = "git diff failed" })
+    local err_msg = table.concat(diff_lines, "\n")
+    return vim.json.encode({
+      error = "git diff failed: " .. (err_msg ~= "" and err_msg or "unknown error"),
+    })
   end
 
   if #diff_lines == 0 then
     return vim.json.encode({})
+  end
+
+  -- Normalize hunk headers for -U0 output.
+  -- With -U0, git omits the count when it's 1 (e.g., "@@ -134 +134,4 @@"
+  -- instead of "@@ -134,1 +134,4 @@"). diffview's parser expects the
+  -- comma-separated form, so we normalize before parsing.
+  for i, line in ipairs(diff_lines) do
+    local old_spec, new_spec = line:match("^@@ %-(%S+) %+(%S+) @@")
+    if old_spec then
+      -- Ensure both sides have the ",count" format
+      if not old_spec:match(",") then
+        old_spec = old_spec .. ",1"
+      end
+      if not new_spec:match(",") then
+        new_spec = new_spec .. ",1"
+      end
+      diff_lines[i] = "@@ -" .. old_spec .. " +" .. new_spec .. " @@"
+    end
   end
 
   -- Parse the diff using diffview's parser
@@ -203,33 +231,18 @@ function DiffviewGoTo(file, line)
     return vim.json.encode({ error = "File not found in diffview: " .. file })
   end
 
+  -- Store the target so the autocmd can position the cursor after diffview
+  -- finishes its async file loading (which resets cursor to line 1).
+  pending_goto = { file = file, line = line }
+
   -- Switch to the target file if it's not already the current one
   local cur_file = panel.cur_file
   if not cur_file or cur_file.path ~= file then
     view:set_file(target)
+  else
+    -- Already on the right file — apply cursor position directly
+    M._apply_pending_goto()
   end
-
-  -- Move cursor to the target line in the right-hand (new version) buffer.
-  -- The layout has windows a (left/old) and b (right/new).
-  -- We need to wait briefly for the file switch to complete, then find
-  -- the right window and set the cursor.
-  vim.schedule(function()
-    -- Find the window showing the "b" (new) side of the diff
-    local layout = target.layout
-    if layout and layout.b and layout.b.file then
-      local b_win = layout.b.win
-      if b_win and vim.api.nvim_win_is_valid(b_win.id) then
-        -- Clamp line to buffer length
-        local bufnr = layout.b.file.bufnr
-        local max_line = vim.api.nvim_buf_line_count(bufnr)
-        local target_line = math.min(math.max(line or 1, 1), max_line)
-        vim.api.nvim_win_set_cursor(b_win.id, { target_line, 0 })
-        -- Center the view on the target line
-        vim.api.nvim_set_current_win(b_win.id)
-        vim.cmd("normal! zz")
-      end
-    end
-  end)
 
   return vim.json.encode({ ok = true })
 end
@@ -243,6 +256,44 @@ function M.on_view_opened(view)
       pre_diffview_bufs[buf] = true
     end
   end
+end
+
+--- Apply a pending cursor position after diffview has finished loading a file.
+--- Called from the DiffviewDiffBufWinEnter autocmd and from DiffviewGoTo when
+--- the file is already displayed.
+function M._apply_pending_goto()
+  if not pending_goto then return end
+
+  local target_line = pending_goto.line
+  pending_goto = nil
+
+  -- Small delay to ensure diffview's own cursor positioning (which resets to
+  -- line 1 on file_open_new) has completed before we override it.
+  vim.defer_fn(function()
+    local ok, lib = pcall(require, "diffview.lib")
+    if not ok then return end
+
+    local view = lib.get_current_view()
+    if not view then return end
+
+    -- Get the main window (right-hand / "b" side in a 2-way diff)
+    local main_win = view.cur_layout:get_main_win()
+    if not main_win or not main_win.id or not vim.api.nvim_win_is_valid(main_win.id) then
+      return
+    end
+
+    local file = main_win.file
+    if not file or not file.bufnr or not vim.api.nvim_buf_is_loaded(file.bufnr) then
+      return
+    end
+
+    -- Clamp line to buffer length
+    local max_line = vim.api.nvim_buf_line_count(file.bufnr)
+    local line = math.min(math.max(target_line or 1, 1), max_line)
+    vim.api.nvim_win_set_cursor(main_win.id, { line, 0 })
+    vim.api.nvim_set_current_win(main_win.id)
+    vim.cmd("normal! zz")
+  end, 50)
 end
 
 --- Diffview hook: called when a diff view is closed.
@@ -288,6 +339,15 @@ function M.setup(opts)
   _G.DiffviewState = DiffviewState
   _G.DiffviewHunks = DiffviewHunks
   _G.DiffviewGoTo = DiffviewGoTo
+
+  -- Listen for diffview's DiffviewDiffBufWinEnter autocmd to apply pending
+  -- cursor positions after async file loading completes.
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "DiffviewDiffBufWinEnter",
+    callback = function()
+      M._apply_pending_goto()
+    end,
+  })
 
   -- Configure diffview hooks
   local dv_ok, diffview = pcall(require, "diffview")
