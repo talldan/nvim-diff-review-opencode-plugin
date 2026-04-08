@@ -1,8 +1,15 @@
 import { type Plugin, tool } from "@opencode-ai/plugin"
 
-interface DiffviewFileInfo {
-  path: string
+// --- Types ---
+
+interface HunkItem {
+  file: string
   status: string
+  old_start: number
+  old_count: number
+  new_start: number
+  new_count: number
+  header: string
 }
 
 interface DiffviewState {
@@ -12,9 +19,18 @@ interface DiffviewState {
   status?: string
   index?: number
   total?: number
-  files?: DiffviewFileInfo[]
+  files?: { path: string; status: string }[]
   error?: string
 }
+
+// --- Review queue state (persists across tool calls within a session) ---
+
+let reviewQueue: HunkItem[] = []
+let reviewPosition = -1 // -1 means review not started
+let reviewRef: string | undefined
+let reviewFiles: string[] | undefined
+
+// --- Neovim socket discovery ---
 
 /**
  * Discover a Neovim RPC socket when NVIM_SOCKET is not explicitly set.
@@ -87,6 +103,40 @@ const discoverNvimSocket = async (): Promise<string | null> => {
   return fallback
 }
 
+// --- Helpers ---
+
+const statusLabel = (status: string | undefined): string =>
+  status === "M" ? "modified" :
+  status === "A" ? "added" :
+  status === "D" ? "deleted" :
+  status === "R" ? "renamed" :
+  status ?? "changed"
+
+const formatHunkPosition = (): string => {
+  if (reviewQueue.length === 0) return "No review in progress."
+  const item = reviewQueue[reviewPosition]
+  return `Reviewing: ${item.file} (${statusLabel(item.status)}) ${item.header} — item ${reviewPosition + 1} of ${reviewQueue.length}.`
+}
+
+/**
+ * Match an order item from the agent to a hunk in the available hunks list.
+ * Identity is {file, old_start, new_start}.
+ */
+const findHunk = (
+  hunks: HunkItem[],
+  orderItem: { file: string; old_start: number; old_count: number; new_start: number; new_count: number }
+): HunkItem | undefined =>
+  hunks.find(
+    h =>
+      h.file === orderItem.file &&
+      h.old_start === orderItem.old_start &&
+      h.old_count === orderItem.old_count &&
+      h.new_start === orderItem.new_start &&
+      h.new_count === orderItem.new_count
+  )
+
+// --- Plugin ---
+
 export const DiffReviewPlugin: Plugin = async (ctx) => {
   return {
     tool: {
@@ -100,53 +150,77 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           "- If you discover lint errors during review, close the diff, fix them, then restart\n\n" +
           "Workflow:\n" +
           "1. Fix any lint/format issues in your changes first\n" +
-          "2. Call with action 'open' to show the diff (optionally scoped to specific files)\n" +
-          "   — the response includes a list of ALL files that will be reviewed\n" +
-          "3. Explain the changes visible in the current file (the response tells you which file is shown)\n" +
-          "4. Ask the user if they have questions or feedback about these changes\n" +
-          "5. If the user requests changes or leaves feedback on the current file, acknowledge it\n" +
-          "   and note it down — but DO NOT make any changes yet. Continue the review.\n" +
-          "6. Call with action 'next' to move to the next changed file\n" +
-          "   — when you reach the last file, 'next' will tell you there are no more files\n" +
-          "7. Repeat steps 3-6 for each file\n" +
-          "8. Call with action 'close' when the review is complete\n" +
-          "9. Propose a git commit message for the CURRENT changes and commit if the user approves\n" +
-          "10. If the user left feedback or change requests during the review, NOW apply them\n" +
+          "2. Call with action 'get_hunks' to retrieve all change hunks across all files.\n" +
+          "   Each hunk includes file path, status, and line range info.\n" +
+          "3. Analyze the hunks and decide a review order. Reorder them for narrative\n" +
+          "   coherence — e.g. show the data model change before the API that uses it,\n" +
+          "   then the UI that calls the API. For small changes, the natural order is fine.\n" +
+          "   You may also filter out hunks that are trivial (e.g. import reordering).\n" +
+          "4. Call with action 'start_review' with the ordered hunks array to open the diff\n" +
+          "   view and begin. If you omit the order, natural hunk order is used.\n" +
+          "5. Explain the current hunk shown in the diff view.\n" +
+          "6. Ask the user if they have questions or feedback about these changes.\n" +
+          "7. If the user requests changes or leaves feedback, acknowledge it and note it\n" +
+          "   down — but DO NOT make any changes yet. Continue the review.\n" +
+          "8. Call with action 'next' to advance to the next item in the review queue.\n" +
+          "   When you reach the last item, 'next' will tell you there are no more items.\n" +
+          "9. Repeat steps 5-8 for each item\n" +
+          "10. Call with action 'close' when the review is complete\n" +
+          "11. Propose a git commit message for the CURRENT changes and commit if the user approves\n" +
+          "12. If the user left feedback or change requests during the review, NOW apply them\n" +
           "    — this creates a clean separation: one commit for the original work,\n" +
           "    a second commit for review feedback changes\n" +
-          "11. If you made feedback changes, offer to walk through them with a second diff_review\n" +
+          "13. If you made feedback changes, offer to walk through them with a second diff_review\n" +
           "    — since the original work is already committed, this diff will only show\n" +
           "    the feedback changes, making them easy to verify\n\n" +
-          "CRITICAL: During the review (steps 3-7), NEVER make changes to files.\n" +
+          "CRITICAL: During the review (steps 5-9), NEVER make changes to files.\n" +
           "Only collect feedback. Apply changes AFTER the review is closed and the\n" +
           "original work is committed.\n\n" +
-          "Every response includes the current file path and position (e.g., '2 of 3') " +
+          "Every response includes the current item and position (e.g., 'item 2 of 5') " +
           "so you always know where you are in the review. Use the 'status' action " +
           "to re-orient if you lose track.",
         args: {
           action: tool.schema
-            .enum(["open", "next", "prev", "close", "status"])
+            .enum(["get_hunks", "start_review", "next", "prev", "status", "close"])
             .describe(
-              "open: show diff view in Neovim. " +
-              "next: navigate to next changed file. " +
-              "prev: navigate to previous changed file. " +
-              "close: close the diff view. " +
-              "status: get current file and position without navigating."
-            ),
-          files: tool.schema
-            .array(tool.schema.string())
-            .optional()
-            .describe(
-              "File paths to include in the diff (open only). " +
-              "Omit to show all uncommitted changes."
+              "get_hunks: retrieve all diff hunks across all files as a flat array. " +
+              "start_review: open the diff view and begin reviewing, optionally with a custom order. " +
+              "next: navigate to the next item in the review queue. " +
+              "prev: navigate to the previous item in the review queue. " +
+              "status: get current position in the review queue without navigating. " +
+              "close: close the diff view and end the review."
             ),
           ref: tool.schema
             .string()
             .optional()
             .describe(
-              "Git ref to diff against (open only). " +
+              "Git ref to diff against (get_hunks and start_review only). " +
               "Defaults to showing uncommitted changes vs HEAD. " +
               "Examples: HEAD~3, a commit hash, origin/main"
+            ),
+          files: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe(
+              "File paths to include in the diff (get_hunks and start_review only). " +
+              "Omit to include all uncommitted changes."
+            ),
+          order: tool.schema
+            .array(
+              tool.schema.object({
+                file: tool.schema.string().describe("Repo-relative file path"),
+                old_start: tool.schema.number().describe("Start line in old version"),
+                old_count: tool.schema.number().describe("Line count in old version"),
+                new_start: tool.schema.number().describe("Start line in new version"),
+                new_count: tool.schema.number().describe("Line count in new version"),
+              })
+            )
+            .optional()
+            .describe(
+              "Custom review order (start_review only). Array of hunk identifiers " +
+              "from the get_hunks response, in the order you want to review them. " +
+              "Each item needs: file, old_start, old_count, new_start, new_count. " +
+              "Omit to use the natural hunk order."
             ),
         },
         async execute(args, context) {
@@ -174,117 +248,172 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
             }
           }
 
-          const statusLabel = (status: string | undefined): string =>
-            status === "M" ? "modified" :
-            status === "A" ? "added" :
-            status === "D" ? "deleted" :
-            status === "R" ? "renamed" :
-            status ?? "changed"
-
-          const formatState = (state: DiffviewState): string => {
-            if (!state.open) return "Diff view is not open."
-            if (!state.current_file)
-              return `Diff view is open but no files to show (${state.total ?? 0} files total).`
-            return `Currently showing: ${state.current_file} (${statusLabel(state.status)}) — file ${state.index} of ${state.total}.`
+          const getHunks = async (ref?: string): Promise<HunkItem[]> => {
+            const luaArg = ref ? `"${ref.replace(/"/g, '\\"')}"` : ""
+            const raw = await nvimExpr(`luaeval("DiffviewHunks(${luaArg})")`)
+            const parsed = JSON.parse(raw.trim())
+            if (parsed.error) throw new Error(parsed.error)
+            return parsed as HunkItem[]
           }
 
-          const formatFileList = (state: DiffviewState): string => {
-            if (!state.files || state.files.length === 0) return ""
-            const list = state.files
-              .map((f, i) => `  ${i + 1}. ${f.path} (${statusLabel(f.status)})`)
-              .join("\n")
-            return `\nFiles to review:\n${list}`
+          const goToHunk = async (item: HunkItem): Promise<void> => {
+            const file = item.file.replace(/"/g, '\\"')
+            // Navigate to the new_start line (the line in the new version)
+            const line = item.new_start > 0 ? item.new_start : 1
+            const raw = await nvimExpr(
+              `luaeval("DiffviewGoTo('${file}', ${line})")`
+            )
+            const result = JSON.parse(raw.trim())
+            if (result.error) throw new Error(result.error)
+            // Give diffview time to switch files and position the cursor
+            await Bun.sleep(300)
           }
 
           try {
             switch (args.action) {
-              case "open": {
-                let cmd = "DiffviewOpen"
-                if (args.ref) {
-                  cmd += ` ${args.ref}`
+              case "get_hunks": {
+                // Store ref/files for later use by start_review
+                reviewRef = args.ref
+                reviewFiles = args.files
+
+                const hunks = await getHunks(args.ref)
+
+                if (hunks.length === 0) {
+                  return "No changes found." +
+                    (args.ref ? ` (compared against ${args.ref})` : "")
                 }
-                if (args.files && args.files.length > 0) {
-                  const escaped = args.files.map(f => f.replace(/ /g, "\\ ")).join(" ")
+
+                // Summarize: count files and hunks
+                const fileSet = new Set(hunks.map(h => h.file))
+                const summary = `Found ${hunks.length} hunk${hunks.length === 1 ? "" : "s"} ` +
+                  `across ${fileSet.size} file${fileSet.size === 1 ? "" : "s"}` +
+                  (args.ref ? ` (compared against ${args.ref})` : "") + ".\n\n"
+
+                return summary + JSON.stringify(hunks, null, 2)
+              }
+
+              case "start_review": {
+                // Use ref/files from get_hunks if not explicitly provided
+                const ref = args.ref ?? reviewRef
+                const files = args.files ?? reviewFiles
+
+                // Open diffview
+                let cmd = "DiffviewOpen"
+                if (ref) {
+                  cmd += ` ${ref}`
+                }
+                if (files && files.length > 0) {
+                  const escaped = files.map(f => f.replace(/ /g, "\\ ")).join(" ")
                   cmd += ` -- ${escaped}`
                 }
                 await nvimExpr(`luaeval("vim.cmd('${cmd.replace(/'/g, "''")}')")`)
-                // Give diffview a moment to populate the file list
+                // Give diffview time to populate the file list
                 await Bun.sleep(500)
-                const state = await getState()
-                return `Opened diff view in Neovim` +
-                  (args.ref ? ` (comparing against ${args.ref})` : " (uncommitted changes vs HEAD)") +
-                  `. ${formatState(state)}` +
-                  formatFileList(state)
+
+                // Build the review queue
+                if (args.order && args.order.length > 0) {
+                  // Agent provided a custom order — resolve each item to a full hunk
+                  const allHunks = await getHunks(ref)
+                  const queue: HunkItem[] = []
+                  const unmatched: string[] = []
+
+                  for (const orderItem of args.order) {
+                    const match = findHunk(allHunks, orderItem)
+                    if (match) {
+                      queue.push(match)
+                    } else {
+                      unmatched.push(`${orderItem.file} ${orderItem.old_start}→${orderItem.new_start}`)
+                    }
+                  }
+
+                  if (queue.length === 0) {
+                    return "Could not match any items in the provided order to actual hunks. " +
+                      `Unmatched: ${unmatched.join(", ")}. ` +
+                      "Call 'get_hunks' to see available hunks."
+                  }
+
+                  reviewQueue = queue
+
+                  if (unmatched.length > 0) {
+                    // Warn but proceed with what we have
+                  }
+                } else {
+                  // No custom order — use natural hunk order
+                  reviewQueue = await getHunks(ref)
+
+                  if (reviewQueue.length === 0) {
+                    return "Opened diff view but no hunks found." +
+                      (ref ? ` (compared against ${ref})` : "")
+                  }
+                }
+
+                // Navigate to the first item
+                reviewPosition = 0
+                await goToHunk(reviewQueue[0])
+
+                return `Started review with ${reviewQueue.length} item${reviewQueue.length === 1 ? "" : "s"}` +
+                  (ref ? ` (comparing against ${ref})` : " (uncommitted changes vs HEAD)") +
+                  `. ${formatHunkPosition()}`
               }
 
               case "next": {
-                const before = await getState()
-                if (!before.open) return "Diff view is not open. Call with action 'open' first."
+                if (reviewQueue.length === 0) {
+                  return "No review in progress. Call 'start_review' first."
+                }
 
-                // If already on the last file, don't navigate (diffview wraps around)
-                if (before.index !== undefined && before.total !== undefined &&
-                    before.index >= before.total) {
-                  return `Already at the last file (file ${before.index} of ${before.total}). ` +
-                    `${formatState(before)} There are no more files to review. ` +
+                if (reviewPosition >= reviewQueue.length - 1) {
+                  return `Already at the last item (item ${reviewPosition + 1} of ${reviewQueue.length}). ` +
+                    `${formatHunkPosition()} There are no more items to review. ` +
                     "Use action 'close' to end the review."
                 }
 
-                await nvimExpr(`luaeval("require('diffview').emit('select_next_entry')")`)
-                await Bun.sleep(200)
-                const after = await getState()
+                reviewPosition++
+                await goToHunk(reviewQueue[reviewPosition])
 
-                // Detect wrap-around: if index went down, diffview wrapped to the beginning
-                if (before.index !== undefined && after.index !== undefined &&
-                    after.index < before.index) {
-                  // Undo the wrap by going back
-                  await nvimExpr(`luaeval("require('diffview').emit('select_prev_entry')")`)
-                  await Bun.sleep(200)
-                  const restored = await getState()
-                  return `Already at the last file (file ${restored.index} of ${restored.total}). ` +
-                    `${formatState(restored)} There are no more files to review. ` +
-                    "Use action 'close' to end the review."
-                }
-
-                return `Navigated to next file. ${formatState(after)}`
+                return `Navigated to next item. ${formatHunkPosition()}`
               }
 
               case "prev": {
-                const before = await getState()
-                if (!before.open) return "Diff view is not open. Call with action 'open' first."
-
-                // If already on the first file, don't navigate (diffview wraps around)
-                if (before.index !== undefined && before.index <= 1) {
-                  return `Already at the first file (file ${before.index} of ${before.total}). ` +
-                    `${formatState(before)} There are no previous files.`
+                if (reviewQueue.length === 0) {
+                  return "No review in progress. Call 'start_review' first."
                 }
 
-                await nvimExpr(`luaeval("require('diffview').emit('select_prev_entry')")`)
-                await Bun.sleep(200)
-                const after = await getState()
-
-                // Detect wrap-around: if index went up, diffview wrapped to the end
-                if (before.index !== undefined && after.index !== undefined &&
-                    after.index > before.index) {
-                  // Undo the wrap by going forward
-                  await nvimExpr(`luaeval("require('diffview').emit('select_next_entry')")`)
-                  await Bun.sleep(200)
-                  const restored = await getState()
-                  return `Already at the first file (file ${restored.index} of ${restored.total}). ` +
-                    `${formatState(restored)} There are no previous files.`
+                if (reviewPosition <= 0) {
+                  return `Already at the first item (item ${reviewPosition + 1} of ${reviewQueue.length}). ` +
+                    `${formatHunkPosition()} There are no previous items.`
                 }
 
-                return `Navigated to previous file. ${formatState(after)}`
+                reviewPosition--
+                await goToHunk(reviewQueue[reviewPosition])
+
+                return `Navigated to previous item. ${formatHunkPosition()}`
               }
 
               case "status": {
                 const state = await getState()
-                if (!state.open) return "Diff view is not currently open."
-                return `${formatState(state)}${formatFileList(state)}`
+                if (!state.open && reviewQueue.length === 0) {
+                  return "No review in progress and diff view is not open."
+                }
+
+                if (reviewQueue.length === 0) {
+                  return "Diff view is open but no review queue. Call 'start_review' to begin."
+                }
+
+                return formatHunkPosition()
               }
 
               case "close": {
                 await nvimExpr(`luaeval("require('diffview').close()")`)
-                return "Closed the diff view in Neovim."
+
+                // Clear review state
+                const itemCount = reviewQueue.length
+                reviewQueue = []
+                reviewPosition = -1
+                reviewRef = undefined
+                reviewFiles = undefined
+
+                return `Closed the diff view and ended the review` +
+                  (itemCount > 0 ? ` (reviewed ${itemCount} item${itemCount === 1 ? "" : "s"}).` : ".")
               }
             }
           } catch (e: any) {
