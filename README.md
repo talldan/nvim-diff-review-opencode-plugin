@@ -85,7 +85,7 @@ Add the plugin to your `opencode.json` configuration:
 
 ```json
 {
-  "plugin": ["github:talldan/nvim-diff-review-opencode-plugin"]
+  "plugin": ["github:talldan/nvim-diff-review-opencode-plugin#main"]
 }
 ```
 
