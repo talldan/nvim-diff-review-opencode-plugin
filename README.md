@@ -45,7 +45,7 @@ A Lua module that:
 - Registers global functions queryable via Neovim's RPC socket:
   - `DiffviewState()` — current diffview state (file, position, file list)
   - `DiffviewHunks(ref?)` — all diff hunks as a flat array, parsed from `git diff` output using diffview.nvim's diff parser
-  - `DiffviewGoTo(file, line)` — navigate diffview to a specific file and line
+  - `DiffviewGoTo(file, hunks)` — navigate diffview to a specific file, position cursor at the first hunk, and fold everything else. Accepts a single hunk spec, an array of hunk specs (for grouped hunks), or a plain line number.
 - Provides diffview.nvim hooks that clean up buffers when the diff view is closed (so reviewed files don't linger as open tabs)
 
 ### 2. OpenCode plugin (`opencode-plugin/index.ts`)
@@ -55,9 +55,10 @@ An OpenCode plugin that registers a `diff_review` tool the AI agent uses to cont
 | Action | Description |
 |--------|-------------|
 | `get_hunks` | Get all diff hunks across all files as a flat array. Each hunk is self-contained with file path, status, and line ranges. Optionally scoped to specific files or a git ref. |
-| `start_review` | Open the diff view and begin the review walk-through. Accepts an optional ordered array of hunks (from `get_hunks`) to control review order. If omitted, uses natural hunk order. Navigates to the first item. |
+| `start_review` | Open the diff view and begin the review walk-through. Accepts an optional array of groups (each group is an array of hunks to show together). If omitted, uses natural hunk order with each hunk as its own item. |
 | `next` | Navigate to the next item in the review queue. Prevents wrap-around at the last item. |
 | `prev` | Navigate to the previous item in the review queue. Prevents wrap-around at the first item. |
+| `include_next` | Expand the visible area to also show the next item alongside the current one. Items must be in the same file. The pointer advances, so `next` after `include_next` skips the already-shown item. `prev` goes back and shows just that single item. |
 | `status` | Get current position in the review queue without navigating. |
 | `close` | Close the diff view and clear the review queue. |
 
@@ -150,20 +151,22 @@ The tool uses Neovim's `--remote-expr` to evaluate Lua expressions on the runnin
 
 The review operates at the **hunk level** rather than the file level. This means:
 
-- A file with 3 separate change regions is presented as 3 review items
+- A file with 3 separate change regions is presented as 3 review items (or fewer if the agent groups them)
+- The agent can **group** nearby hunks in the same file into a single review item — e.g., 3 small changes within one function become one item instead of three
 - The agent can reorder hunks across files for narrative coherence (e.g., show a data model change in `model.ts` before the API endpoint in `api.ts` that uses it, even if they're in different files)
-- Small files with a single change are naturally one review item
 - The agent can filter out trivial hunks (e.g., import reordering) from the review
+- During review, `include_next` can dynamically expand the visible area to include the next item — useful when the agent realizes adjacent items should be reviewed together
 
 Hunks are retrieved by running `git diff -U0` and parsing the output with diffview.nvim's built-in unified diff parser (`diffview.vcs.utils.parse_diff`). The `-U0` flag produces zero-context hunks, giving exact change boundaries. (Note: `-U0` omits the count in hunk headers when it's 1, e.g., `@@ -134 +134,4 @@`. The plugin normalizes these to the `N,M` form before parsing.)
 
 ### Hunk-focus folding
 
-When navigating to a hunk, the plugin folds all other regions of the file so only the target hunk is visible — similar to `git add -p`. This is achieved by:
+When navigating to a hunk (or group of hunks), the plugin folds all other regions of the file so only the target area is visible — similar to `git add -p`. This is achieved by:
 
 1. Switching both diff windows from `foldmethod=diff` to `foldmethod=manual`
-2. Creating two manual folds: one above the hunk and one below
-3. Showing 5 lines of context above and below the hunk
+2. Computing the bounding box across all hunks in the group (from earliest start to latest end)
+3. Creating two manual folds: one above the bounding box and one below
+4. Showing 5 lines of context above and below the visible area
 
 The fold highlight is overridden with a custom `DiffviewDiffFoldedReview` highlight group (linked to `Comment` by default) so fold lines look like muted separators rather than diff modifications. Users can override this highlight group in their colorscheme.
 
@@ -173,8 +176,9 @@ Line numbers are switched to absolute (`number`, no `relativenumber`) during hun
 
 The review queue is managed on the TypeScript (OpenCode plugin) side. It holds:
 
-- An ordered array of hunk items (set by `start_review`)
+- An ordered array of review items, where each item contains one or more hunks (set by `start_review`)
 - The current position in the queue (advanced by `next`/`prev`)
+- A visible range (which may span multiple queue items when `include_next` is used)
 
 The Lua (Neovim) side is stateless — it provides functions to query hunks and navigate the diff view, but doesn't track review progress. This keeps the Neovim plugin simple and the state management in one place.
 
@@ -192,6 +196,7 @@ The Lua (Neovim) side is stateless — it provides functions to query hunks and 
 The tool description embeds detailed workflow instructions for the AI agent:
 
 - **Lint before review**: The agent is told to fix lint/format issues before opening the diff, so the user only sees clean changes.
+- **Grouping**: The agent groups nearby hunks in the same file (especially within the same function) into single review items, reducing a 60-hunk diff to ~15-20 items.
 - **Narrative ordering**: The agent analyzes hunks and reorders them for coherent presentation — explaining foundational changes before dependent ones.
 - **No edits during review**: The agent is explicitly instructed to never edit files during the review. Feedback is collected and applied afterward.
 - **Two-commit pattern**: Original work is committed first, then feedback changes are committed separately. This gives clean git history and allows the second review to show only the feedback diff.

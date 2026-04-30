@@ -195,17 +195,19 @@ function DiffviewHunks(ref)
   return vim.json.encode(hunks)
 end
 
---- Navigate diffview to a specific file and hunk.
+--- Navigate diffview to a specific file and hunk(s).
 ---
 --- Finds the file in diffview's file list, switches to it if needed,
---- positions the cursor at the hunk, and folds all other regions so only
---- the target hunk (with a few context lines) is visible.
+--- positions the cursor at the first hunk, and folds all other regions so
+--- only the target hunk(s) (with a few context lines) are visible.
 ---
 --- @param file string Repo-relative file path
---- @param line_or_hunk number|table Either a line number or a hunk spec table:
----                                   { new_start, new_count, old_start, old_count }
+--- @param line_or_hunks number|table Either:
+---   - A line number (number) — just positions cursor, no folding
+---   - A single hunk spec: { new_start, new_count, old_start, old_count }
+---   - An array of hunk specs: { {new_start, ...}, {new_start, ...} }
 --- @return string JSON-encoded result: { ok: true } or { error: string }
-function DiffviewGoTo(file, line_or_hunk)
+function DiffviewGoTo(file, line_or_hunks)
   local ok, lib = pcall(require, "diffview.lib")
   if not ok then
     return vim.json.encode({ error = "diffview.nvim not loaded" })
@@ -233,17 +235,34 @@ function DiffviewGoTo(file, line_or_hunk)
     return vim.json.encode({ error = "File not found in diffview: " .. file })
   end
 
+  -- Normalize the second argument into a list of hunk specs (or nil).
+  -- Accepts: number, single hunk table, or array of hunk tables.
+  local hunks = nil
+  local target_line = 1
+
+  if type(line_or_hunks) == "number" then
+    target_line = line_or_hunks
+  elseif type(line_or_hunks) == "table" then
+    if line_or_hunks.new_start then
+      -- Single hunk spec
+      hunks = { line_or_hunks }
+    elseif #line_or_hunks > 0 then
+      -- Array of hunk specs
+      hunks = line_or_hunks
+    end
+
+    if hunks then
+      -- Position cursor at the first hunk
+      target_line = hunks[1].new_start > 0 and hunks[1].new_start or 1
+    end
+  end
+
   -- Store the target so the autocmd can position the cursor and set up folds
   -- after diffview finishes its async file loading.
-  local hunk_spec = type(line_or_hunk) == "table" and line_or_hunk or nil
-  local target_line = hunk_spec
-    and (hunk_spec.new_start > 0 and hunk_spec.new_start or 1)
-    or (type(line_or_hunk) == "number" and line_or_hunk or 1)
-
   pending_goto = {
     file = file,
     line = target_line,
-    hunk = hunk_spec,
+    hunks = hunks,
   }
 
   -- Switch to the target file if it's not already the current one
@@ -281,7 +300,7 @@ function M._apply_pending_goto()
   if not pending_goto then return end
 
   local target_line = pending_goto.line
-  local hunk = pending_goto.hunk
+  local hunks = pending_goto.hunks
   pending_goto = nil
 
   -- Small delay to ensure diffview's own cursor positioning (which resets to
@@ -307,34 +326,35 @@ function M._apply_pending_goto()
       return
     end
 
-    -- Position cursor at the hunk
+    -- Position cursor at the first hunk
     local max_line = vim.api.nvim_buf_line_count(main_file.bufnr)
     local line = math.min(math.max(target_line or 1, 1), max_line)
     vim.api.nvim_win_set_cursor(main_win.id, { line, 0 })
     vim.api.nvim_set_current_win(main_win.id)
 
     -- Set up hunk-focus folds if we have hunk boundaries
-    if hunk then
-      M._apply_hunk_focus(view, hunk)
+    if hunks and #hunks > 0 then
+      M._apply_hunk_focus(view, hunks)
     end
 
     vim.cmd("normal! zz")
   end, 50)
 end
 
---- Create folds that hide everything except the target hunk and a few
---- context lines around it. Switches both diff windows to foldmethod=manual.
+--- Create folds that hide everything except the target hunk(s) and a few
+--- context lines around them. Switches both diff windows to foldmethod=manual.
+---
+--- When multiple hunks are provided, computes the bounding box across all of
+--- them so the entire region from the first to the last hunk is visible.
 ---
 --- @param view table The current DiffView
---- @param hunk table Hunk spec: { new_start, new_count, old_start, old_count }
-function M._apply_hunk_focus(view, hunk)
+--- @param hunks table[] Array of hunk specs: { new_start, new_count, old_start, old_count }
+function M._apply_hunk_focus(view, hunks)
   local layout = view.cur_layout
-  if not layout then return end
+  if not layout or #hunks == 0 then return end
 
-  -- Compute the visible range for each side (old = "a", new = "b").
-  -- layout.a and layout.b are Window objects with .id and .file properties.
-  -- A hunk with count=0 means pure insertion/deletion — show context around
-  -- the start line instead.
+  -- Compute the bounding box for each side (old = "a", new = "b") across
+  -- all hunks. layout.a and layout.b are Window objects with .id and .file.
   local sides = {}
 
   -- "b" side (new/right) — uses new_start/new_count
@@ -342,13 +362,19 @@ function M._apply_hunk_focus(view, hunk)
     and vim.api.nvim_buf_is_loaded(layout.b.file.bufnr)
   then
     local lcount = vim.api.nvim_buf_line_count(layout.b.file.bufnr)
-    local hunk_first = hunk.new_start > 0 and hunk.new_start or 1
-    local hunk_last = hunk.new_count > 0 and (hunk.new_start + hunk.new_count - 1) or hunk_first
+    local bbox_first = math.huge
+    local bbox_last = 0
+    for _, hunk in ipairs(hunks) do
+      local hunk_first = hunk.new_start > 0 and hunk.new_start or 1
+      local hunk_last = hunk.new_count > 0 and (hunk.new_start + hunk.new_count - 1) or hunk_first
+      bbox_first = math.min(bbox_first, hunk_first)
+      bbox_last = math.max(bbox_last, hunk_last)
+    end
     table.insert(sides, {
       win_id = layout.b.id,
       lcount = lcount,
-      hunk_first = hunk_first,
-      hunk_last = hunk_last,
+      hunk_first = bbox_first,
+      hunk_last = bbox_last,
     })
   end
 
@@ -357,13 +383,19 @@ function M._apply_hunk_focus(view, hunk)
     and vim.api.nvim_buf_is_loaded(layout.a.file.bufnr)
   then
     local lcount = vim.api.nvim_buf_line_count(layout.a.file.bufnr)
-    local hunk_first = hunk.old_start > 0 and hunk.old_start or 1
-    local hunk_last = hunk.old_count > 0 and (hunk.old_start + hunk.old_count - 1) or hunk_first
+    local bbox_first = math.huge
+    local bbox_last = 0
+    for _, hunk in ipairs(hunks) do
+      local hunk_first = hunk.old_start > 0 and hunk.old_start or 1
+      local hunk_last = hunk.old_count > 0 and (hunk.old_start + hunk.old_count - 1) or hunk_first
+      bbox_first = math.min(bbox_first, hunk_first)
+      bbox_last = math.max(bbox_last, hunk_last)
+    end
     table.insert(sides, {
       win_id = layout.a.id,
       lcount = lcount,
-      hunk_first = hunk_first,
-      hunk_last = hunk_last,
+      hunk_first = bbox_first,
+      hunk_last = bbox_last,
     })
   end
 

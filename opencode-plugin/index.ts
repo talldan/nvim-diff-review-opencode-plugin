@@ -12,6 +12,13 @@ interface HunkItem {
   header: string
 }
 
+/** A review item is a group of one or more hunks in the same file. */
+interface ReviewItem {
+  file: string
+  status: string
+  hunks: HunkItem[]
+}
+
 interface DiffviewState {
   open: boolean
   current_file?: string | null
@@ -25,8 +32,11 @@ interface DiffviewState {
 
 // --- Review queue state (persists across tool calls within a session) ---
 
-let reviewQueue: HunkItem[] = []
+let reviewQueue: ReviewItem[] = []
 let reviewPosition = -1 // -1 means review not started
+/** Tracks which queue items are currently visible (for include_next). */
+let visibleFrom = 0
+let visibleTo = 0
 let reviewRef: string | undefined
 let reviewFiles: string[] | undefined
 
@@ -120,8 +130,17 @@ const statusLabel = (status: string | undefined): string =>
 const formatHunkPosition = (): string => {
   if (reviewQueue.length === 0) return "No review in progress."
   const item = reviewQueue[reviewPosition]
-  const fileCount = new Set(reviewQueue.map(h => h.file)).size
-  return `Reviewing: ${item.file} (${statusLabel(item.status)}) ${item.header} — item ${reviewPosition + 1} of ${reviewQueue.length} across ${fileCount} file${fileCount === 1 ? "" : "s"}.`
+  const hunkCount = item.hunks.length
+  const fileCount = new Set(reviewQueue.map(r => r.file)).size
+  const visibleCount = visibleTo - visibleFrom + 1
+  let msg = `Reviewing: ${item.file} (${statusLabel(item.status)}) — item ${reviewPosition + 1} of ${reviewQueue.length} across ${fileCount} file${fileCount === 1 ? "" : "s"}.`
+  if (hunkCount > 1) {
+    msg += ` (${hunkCount} hunks grouped)`
+  }
+  if (visibleCount > 1) {
+    msg += ` Showing items ${visibleFrom + 1}–${visibleTo + 1} together.`
+  }
+  return msg
 }
 
 /**
@@ -144,21 +163,50 @@ const findHunk = (
 /**
  * Format a summary of the files covered in the review queue.
  */
-const formatQueueSummary = (queue: HunkItem[]): string => {
-  const fileGroups = new Map<string, { status: string; count: number }>()
+const formatQueueSummary = (queue: ReviewItem[]): string => {
+  const fileGroups = new Map<string, { status: string; count: number; hunkCount: number }>()
   for (const item of queue) {
     const existing = fileGroups.get(item.file)
     if (existing) {
       existing.count++
+      existing.hunkCount += item.hunks.length
     } else {
-      fileGroups.set(item.file, { status: item.status, count: 1 })
+      fileGroups.set(item.file, { status: item.status, count: 1, hunkCount: item.hunks.length })
     }
   }
   const lines = Array.from(fileGroups.entries()).map(
-    ([file, { status, count }]) =>
-      `  ${file} (${statusLabel(status)}) — ${count} hunk${count === 1 ? "" : "s"}`
+    ([file, { status, count, hunkCount }]) => {
+      const itemLabel = `${count} item${count === 1 ? "" : "s"}`
+      const hunkLabel = hunkCount !== count ? ` (${hunkCount} hunks)` : ""
+      return `  ${file} (${statusLabel(status)}) — ${itemLabel}${hunkLabel}`
+    }
   )
   return `\nFiles in review:\n${lines.join("\n")}`
+}
+
+/**
+ * Collect all hunks from queue items between fromIdx and toIdx (inclusive)
+ * that belong to the same file. Returns the combined hunks array.
+ */
+const collectVisibleHunks = (queue: ReviewItem[], fromIdx: number, toIdx: number): HunkItem[] => {
+  const hunks: HunkItem[] = []
+  for (let i = fromIdx; i <= toIdx; i++) {
+    hunks.push(...queue[i].hunks)
+  }
+  return hunks
+}
+
+/**
+ * Build the Lua hunk spec string for DiffviewGoTo.
+ * For a single hunk: {new_start=N, new_count=N, old_start=N, old_count=N}
+ * For multiple hunks: {{...}, {...}, ...}
+ */
+const buildHunkSpec = (hunks: HunkItem[]): string => {
+  const specs = hunks.map(
+    h => `{new_start=${h.new_start},new_count=${h.new_count},old_start=${h.old_start},old_count=${h.old_count}}`
+  )
+  if (specs.length === 1) return specs[0]
+  return `{${specs.join(",")}}`
 }
 
 // --- Plugin ---
@@ -178,18 +226,32 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           "1. Fix any lint/format issues in your changes first\n" +
           "2. Call with action 'get_hunks' to retrieve all change hunks across all files.\n" +
           "   Each hunk includes file path, status, and line range info.\n" +
-          "3. Analyze the hunks and decide a review order. Reorder them for narrative\n" +
-          "   coherence — e.g. show the data model change before the API that uses it,\n" +
-          "   then the UI that calls the API. For small changes, the natural order is fine.\n" +
-          "   You may also filter out hunks that are trivial (e.g. import reordering).\n" +
-          "4. Call with action 'start_review' with the ordered hunks array to open the diff\n" +
+          "3. Analyze the hunks and decide a review order. Group and reorder them:\n" +
+          "   - GROUP hunks that are in the same file and modify the same function or\n" +
+          "     logical block. Adjacent or nearby hunks (within ~30 lines) in the same\n" +
+          "     file should almost always be grouped together. This is important — without\n" +
+          "     grouping, a function with 3 small changes becomes 3 separate review items.\n" +
+          "   - GROUP all import/require changes at the top of a file into one item.\n" +
+          "   - REORDER for narrative coherence — e.g. show the data model change before\n" +
+          "     the API that uses it, then the UI that calls the API.\n" +
+          "   - FILTER OUT hunks that are trivial (e.g. whitespace-only changes).\n" +
+          "   - Aim for roughly 10-20 review items even for large diffs.\n" +
+          "   The 'order' parameter accepts an array of groups. Each group is an array of\n" +
+          "   hunks that will be shown together as one review item. Single-hunk groups are\n" +
+          "   fine — just wrap the hunk in an array.\n" +
+          "4. Call with action 'start_review' with the ordered groups to open the diff\n" +
           "   view and begin. If you omit the order, natural hunk order is used.\n" +
-          "5. Explain the current hunk shown in the diff view.\n" +
+          "5. Explain the current item shown in the diff view.\n" +
           "6. Ask the user if they have questions or feedback about these changes.\n" +
           "7. If the user requests changes or leaves feedback, acknowledge it and note it\n" +
           "   down — but DO NOT make any changes yet. Continue the review.\n" +
           "8. Call with action 'next' to advance to the next item in the review queue.\n" +
           "   When you reach the last item, 'next' will tell you there are no more items.\n" +
+          "   Alternatively, use 'include_next' to expand the visible area to also show\n" +
+          "   the next item — useful when adjacent items are closely related and benefit\n" +
+          "   from being reviewed together. The pointer advances so 'next' after\n" +
+          "   'include_next' moves to the item after the expanded ones. 'prev' goes back\n" +
+          "   and shows just that single item.\n" +
           "9. Repeat steps 5-8 for each item\n" +
           "10. Call with action 'close' when the review is complete\n" +
           "11. Propose a git commit message for the CURRENT changes and commit if the user approves\n" +
@@ -207,12 +269,13 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           "to re-orient if you lose track.",
         args: {
           action: tool.schema
-            .enum(["get_hunks", "start_review", "next", "prev", "status", "close"])
+            .enum(["get_hunks", "start_review", "next", "prev", "include_next", "status", "close"])
             .describe(
               "get_hunks: retrieve all diff hunks across all files as a flat array. " +
               "start_review: open the diff view and begin reviewing, optionally with a custom order. " +
               "next: navigate to the next item in the review queue. " +
               "prev: navigate to the previous item in the review queue. " +
+              "include_next: expand the visible area to also show the next item alongside the current one (items must be in the same file). " +
               "status: get current position in the review queue without navigating. " +
               "close: close the diff view and end the review."
             ),
@@ -233,20 +296,24 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
             ),
           order: tool.schema
             .array(
-              tool.schema.object({
-                file: tool.schema.string().describe("Repo-relative file path"),
-                old_start: tool.schema.number().describe("Start line in old version"),
-                old_count: tool.schema.number().describe("Line count in old version"),
-                new_start: tool.schema.number().describe("Start line in new version"),
-                new_count: tool.schema.number().describe("Line count in new version"),
-              })
+              tool.schema.array(
+                tool.schema.object({
+                  file: tool.schema.string().describe("Repo-relative file path"),
+                  old_start: tool.schema.number().describe("Start line in old version"),
+                  old_count: tool.schema.number().describe("Line count in old version"),
+                  new_start: tool.schema.number().describe("Start line in new version"),
+                  new_count: tool.schema.number().describe("Line count in new version"),
+                })
+              )
             )
             .optional()
             .describe(
-              "Custom review order (start_review only). Array of hunk identifiers " +
-              "from the get_hunks response, in the order you want to review them. " +
-              "Each item needs: file, old_start, old_count, new_start, new_count. " +
-              "Omit to use the natural hunk order."
+              "Custom review order (start_review only). Array of groups, where each group " +
+              "is an array of hunks to show together as one review item. Hunks within a " +
+              "group must be in the same file. Single-hunk groups are fine: [[hunk1], [hunk2]]. " +
+              "To group nearby hunks: [[hunk1, hunk2], [hunk3]]. " +
+              "Each hunk needs: file, old_start, old_count, new_start, new_count. " +
+              "Omit to use the natural hunk order (each hunk as its own item)."
             ),
         },
         async execute(args, context) {
@@ -282,10 +349,10 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
             return parsed as HunkItem[]
           }
 
-          const goToHunk = async (item: HunkItem): Promise<void> => {
-            const file = item.file.replace(/"/g, '\\"')
-            // Pass hunk boundaries so Lua can set up folds to focus on this hunk
-            const hunkSpec = `{new_start=${item.new_start},new_count=${item.new_count},old_start=${item.old_start},old_count=${item.old_count}}`
+          /** Navigate diffview to show one or more hunks with fold focus. */
+          const showHunks = async (hunks: HunkItem[]): Promise<void> => {
+            const file = hunks[0].file.replace(/"/g, '\\"')
+            const hunkSpec = buildHunkSpec(hunks)
             const raw = await nvimExpr(
               `luaeval("DiffviewGoTo('${file}', ${hunkSpec})")`
             )
@@ -294,6 +361,12 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
             // Give diffview time to switch files and the Lua side to
             // position cursor and set up folds
             await Bun.sleep(500)
+          }
+
+          /** Navigate to the current visible range in the queue. */
+          const showCurrentVisible = async (): Promise<void> => {
+            const hunks = collectVisibleHunks(reviewQueue, visibleFrom, visibleTo)
+            await showHunks(hunks)
           }
 
           try {
@@ -339,17 +412,27 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
 
                 // Build the review queue
                 if (args.order && args.order.length > 0) {
-                  // Agent provided a custom order — resolve each item to a full hunk
+                  // Agent provided grouped order — resolve each group
                   const allHunks = await getHunks(ref)
-                  const queue: HunkItem[] = []
+                  const queue: ReviewItem[] = []
                   const unmatched: string[] = []
 
-                  for (const orderItem of args.order) {
-                    const match = findHunk(allHunks, orderItem)
-                    if (match) {
-                      queue.push(match)
-                    } else {
-                      unmatched.push(`${orderItem.file} ${orderItem.old_start}→${orderItem.new_start}`)
+                  for (const group of args.order) {
+                    const resolvedHunks: HunkItem[] = []
+                    for (const orderItem of group) {
+                      const match = findHunk(allHunks, orderItem)
+                      if (match) {
+                        resolvedHunks.push(match)
+                      } else {
+                        unmatched.push(`${orderItem.file} ${orderItem.old_start}→${orderItem.new_start}`)
+                      }
+                    }
+                    if (resolvedHunks.length > 0) {
+                      queue.push({
+                        file: resolvedHunks[0].file,
+                        status: resolvedHunks[0].status,
+                        hunks: resolvedHunks,
+                      })
                     }
                   }
 
@@ -360,23 +443,27 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
                   }
 
                   reviewQueue = queue
-
-                  if (unmatched.length > 0) {
-                    // Warn but proceed with what we have
-                  }
                 } else {
-                  // No custom order — use natural hunk order
-                  reviewQueue = await getHunks(ref)
+                  // No custom order — each hunk becomes its own review item
+                  const allHunks = await getHunks(ref)
 
-                  if (reviewQueue.length === 0) {
+                  if (allHunks.length === 0) {
                     return "Opened diff view but no hunks found." +
                       (ref ? ` (compared against ${ref})` : "")
                   }
+
+                  reviewQueue = allHunks.map(h => ({
+                    file: h.file,
+                    status: h.status,
+                    hunks: [h],
+                  }))
                 }
 
                 // Navigate to the first item
                 reviewPosition = 0
-                await goToHunk(reviewQueue[0])
+                visibleFrom = 0
+                visibleTo = 0
+                await showCurrentVisible()
 
                 return `Started review with ${reviewQueue.length} item${reviewQueue.length === 1 ? "" : "s"}` +
                   (ref ? ` (comparing against ${ref})` : " (uncommitted changes vs HEAD)") +
@@ -389,14 +476,18 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
                   return "No review in progress. Call 'start_review' first."
                 }
 
-                if (reviewPosition >= reviewQueue.length - 1) {
+                // Advance past the current visible range
+                const nextPos = visibleTo + 1
+                if (nextPos >= reviewQueue.length) {
                   return `Already at the last item (item ${reviewPosition + 1} of ${reviewQueue.length}). ` +
                     `${formatHunkPosition()} There are no more items to review. ` +
                     "Use action 'close' to end the review."
                 }
 
-                reviewPosition++
-                await goToHunk(reviewQueue[reviewPosition])
+                reviewPosition = nextPos
+                visibleFrom = nextPos
+                visibleTo = nextPos
+                await showCurrentVisible()
 
                 return `Navigated to next item. ${formatHunkPosition()}`
               }
@@ -406,15 +497,47 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
                   return "No review in progress. Call 'start_review' first."
                 }
 
-                if (reviewPosition <= 0) {
+                // Go back one item before the current visible range
+                const prevPos = visibleFrom - 1
+                if (prevPos < 0) {
                   return `Already at the first item (item ${reviewPosition + 1} of ${reviewQueue.length}). ` +
                     `${formatHunkPosition()} There are no previous items.`
                 }
 
-                reviewPosition--
-                await goToHunk(reviewQueue[reviewPosition])
+                reviewPosition = prevPos
+                visibleFrom = prevPos
+                visibleTo = prevPos
+                await showCurrentVisible()
 
                 return `Navigated to previous item. ${formatHunkPosition()}`
+              }
+
+              case "include_next": {
+                if (reviewQueue.length === 0) {
+                  return "No review in progress. Call 'start_review' first."
+                }
+
+                const nextPos = visibleTo + 1
+                if (nextPos >= reviewQueue.length) {
+                  return `Already showing the last item (item ${reviewPosition + 1} of ${reviewQueue.length}). ` +
+                    "There are no more items to include."
+                }
+
+                // Check that the next item is in the same file
+                const currentFile = reviewQueue[visibleFrom].file
+                const nextItem = reviewQueue[nextPos]
+                if (nextItem.file !== currentFile) {
+                  return `Cannot include next item — it is in a different file ` +
+                    `(${nextItem.file} vs ${currentFile}). ` +
+                    `Use 'next' to navigate to it instead.`
+                }
+
+                // Extend the visible range to include the next item
+                reviewPosition = nextPos
+                visibleTo = nextPos
+                await showCurrentVisible()
+
+                return `Expanded view to include next item. ${formatHunkPosition()}`
               }
 
               case "status": {
@@ -437,6 +560,8 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
                 const itemCount = reviewQueue.length
                 reviewQueue = []
                 reviewPosition = -1
+                visibleFrom = 0
+                visibleTo = 0
                 reviewRef = undefined
                 reviewFiles = undefined
 
