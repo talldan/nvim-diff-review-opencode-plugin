@@ -411,6 +411,9 @@ function M._apply_hunk_focus(view, hunks)
         vim.wo.number = true
         vim.wo.relativenumber = false
 
+        -- Wrap long lines so all content is visible without horizontal scrolling
+        vim.wo.wrap = true
+
         -- Override the Folded highlight in this window so fold lines don't
         -- look like diff modifications. Uses winhl to scope it to this window.
         local existing_winhl = vim.wo.winhl or ""
