@@ -46,6 +46,7 @@ A Lua module that:
   - `DiffviewState()` — current diffview state (file, position, file list)
   - `DiffviewHunks(ref?)` — all diff hunks as a flat array, parsed from `git diff` output using diffview.nvim's diff parser
   - `DiffviewGoTo(file, hunks)` — navigate diffview to a specific file, position cursor at the first hunk, and fold everything else. Accepts a single hunk spec, an array of hunk specs (for grouped hunks), or a plain line number.
+  - `DiffviewPluginVersion()` — Neovim-side plugin version used to verify compatibility with the OpenCode plugin.
 - Provides diffview.nvim hooks that clean up buffers when the diff view is closed (so reviewed files don't linger as open tabs)
 
 ### 2. OpenCode plugin (`opencode-plugin/index.ts`)
@@ -61,7 +62,7 @@ An OpenCode plugin that registers a `diff_review` tool the AI agent uses to cont
 | `include_next` | Expand the visible area to also show the next item alongside the current one. Items must be in the same file. The pointer advances, so `next` after `include_next` skips the already-shown item. `prev` goes back and shows just that single item. |
 | `status` | Get current position in the review queue without navigating. |
 | `close` | Close the diff view and clear the review queue. |
-| `plugin_version` | Return the plugin version for diagnostics. Does not require Neovim. |
+| `plugin_version` | Return OpenCode-side and Neovim-side plugin versions for diagnostics, plus whether they match. |
 
 ## Dependencies
 
@@ -154,6 +155,7 @@ The review operates at the **hunk level** rather than the file level. This means
 
 - A file with 3 separate change regions is presented as 3 review items (or fewer if the agent groups them)
 - The agent can **group** nearby hunks in the same file into a single review item — e.g., 3 small changes within one function become one item instead of three
+- Grouping should account for both conceptual relationship and physical proximity. Distant helper definitions, call sites, and tests should usually be separate review items even when conceptually related.
 - The agent can reorder hunks across files for narrative coherence (e.g., show a data model change in `model.ts` before the API endpoint in `api.ts` that uses it, even if they're in different files)
 - The agent can filter out trivial hunks (e.g., import reordering) from the review
 - During review, `include_next` can dynamically expand the visible area to include the next item — useful when the agent realizes adjacent items should be reviewed together
@@ -172,6 +174,8 @@ When navigating to a hunk (or group of hunks), the plugin folds all other region
 The fold highlight is overridden with a custom `DiffviewDiffFoldedReview` highlight group (linked to `Comment` by default) so fold lines look like muted separators rather than diff modifications. Users can override this highlight group in their colorscheme.
 
 Line numbers are switched to absolute (`number`, no `relativenumber`) during hunk focus so they match the line ranges shown in the hunk headers.
+
+If a review item groups hunks that span more than 200 lines, `start_review` emits a grouping warning. This nudges the agent to split distant helper definitions, call sites, or tests into separate review items before the review becomes unwieldy.
 
 ### Review queue
 
@@ -192,6 +196,7 @@ The Lua (Neovim) side is stateless — it provides functions to query hunks and 
 - **Async cursor positioning**: `DiffviewGoTo` stores a pending target and applies it via a `DiffviewDiffBufWinEnter` autocmd + `vim.defer_fn`. This ensures the cursor is positioned after diffview's async `set_file` completes (which resets cursor to line 1 on `file_open_new`).
 - **Socket auto-discovery**: When `NVIM_SOCKET` is not set, the tool scans `$TMPDIR/nvim.$USER/` and `/tmp` for Neovim socket files, verifies each is live, and uses `lsof` to match the Neovim process's working directory against the current project. This allows zero-configuration usage in ad-hoc terminals — just run `nvim` and OpenCode will find it.
 - **Line wrapping**: Diff windows have `wrap` enabled during hunk focus so long lines are fully visible without horizontal scrolling.
+- **Version handshake**: `plugin_version` reports both the OpenCode and Neovim plugin versions. Neovim-dependent actions preflight the required Lua globals and report clearly if the two sides are mismatched.
 
 ### Review workflow instructions
 
@@ -202,7 +207,46 @@ The tool description embeds detailed workflow instructions for the AI agent:
 - **Narrative ordering**: The agent analyzes hunks and reorders them for coherent presentation — explaining foundational changes before dependent ones.
 - **No edits during review**: The agent is explicitly instructed to never edit files during the review. Feedback is collected and applied afterward.
 - **Two-commit pattern**: Original work is committed first, then feedback changes are committed separately. This gives clean git history and allows the second review to show only the feedback diff.
+- **Line-numbered explanations**: The agent references relevant line numbers when explaining each review item, making it easy to map comments back to the visible diff.
 - **Interactive pacing**: The agent explains each hunk, asks for feedback, and waits for the user's response before moving on.
+
+## Troubleshooting
+
+### OpenCode and Neovim plugin versions differ
+
+Run the diagnostic action:
+
+```json
+{ "action": "plugin_version" }
+```
+
+Expected output should show matching versions:
+
+```text
+OpenCode plugin: v0.6.1
+Neovim plugin: v0.6.1
+Compatible: yes
+```
+
+If OpenCode reports an older version, clear OpenCode's plugin cache and restart OpenCode:
+
+```bash
+rm -rf ~/.cache/opencode/packages/opencode-nvim-diff-review@latest
+```
+
+If Neovim reports an older version, update the Neovim plugin (for lazy.nvim, run `:Lazy update`) and restart Neovim.
+
+### Neovim is reachable but diff-review Lua globals are missing
+
+The tool checks for `DiffviewState`, `DiffviewHunks`, and `DiffviewGoTo` before running Neovim-dependent actions. If these are missing, the Neovim plugin has not loaded or `require("diff-review").setup()` has not run in that Neovim session.
+
+If the plugin is installed but not loaded, run this in Neovim:
+
+```vim
+:lua require("diff-review").setup()
+```
+
+Then retry the tool action.
 
 ## Future improvements
 

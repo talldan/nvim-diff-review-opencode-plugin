@@ -1,5 +1,8 @@
 import { type Plugin, tool } from "@opencode-ai/plugin"
 
+const PLUGIN_VERSION = "0.6.1"
+const DISTANT_GROUP_SPAN_LINES = 200
+
 // --- Types ---
 
 interface HunkItem {
@@ -28,6 +31,14 @@ interface DiffviewState {
   total?: number
   files?: { path: string; status: string }[]
   error?: string
+}
+
+interface NvimRpcError extends Error {
+  socket: string
+  expr: string
+  exitCode: number
+  stdout: string
+  stderr: string
 }
 
 // --- Review queue state (persists across tool calls within a session) ---
@@ -190,6 +201,38 @@ const formatQueueSummary = (queue: ReviewItem[]): string => {
   return `${header}\n${lines.join("\n")}`
 }
 
+const hunkStart = (hunk: HunkItem): number =>
+  hunk.new_start > 0 ? hunk.new_start : hunk.old_start
+
+const hunkEnd = (hunk: HunkItem): number => {
+  const start = hunkStart(hunk)
+  const count = hunk.new_count > 0 ? hunk.new_count : hunk.old_count
+  return count > 0 ? start + count - 1 : start
+}
+
+const formatGroupingWarnings = (queue: ReviewItem[]): string => {
+  const warnings = queue.flatMap((item, index) => {
+    if (item.hunks.length <= 1) return []
+
+    const first = Math.min(...item.hunks.map(hunkStart))
+    const last = Math.max(...item.hunks.map(hunkEnd))
+    const span = last - first + 1
+
+    if (span <= DISTANT_GROUP_SPAN_LINES) return []
+
+    return [
+      `  Item ${index + 1}: ${item.file} groups ${item.hunks.length} hunks across ${span} lines (${first}-${last})`,
+    ]
+  })
+
+  if (warnings.length === 0) return ""
+
+  return "\n\nGrouping warnings:\n" +
+    `Some grouped items span more than ${DISTANT_GROUP_SPAN_LINES} lines. ` +
+    "Consider splitting distant helper definitions, call sites, or tests into separate review items unless they cannot be understood independently.\n" +
+    warnings.join("\n")
+}
+
 /**
  * Collect all hunks from queue items between fromIdx and toIdx (inclusive)
  * that belong to the same file. Returns the combined hunks array.
@@ -215,6 +258,32 @@ const buildHunkSpec = (hunks: HunkItem[]): string => {
   return `{${specs.join(",")}}`
 }
 
+const luaString = (value: string): string =>
+  `"${value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")}"`
+
+const luaEval = (code: string): string =>
+  `luaeval('${code.replace(/'/g, "''")}')`
+
+const formatRpcError = (error: NvimRpcError): string => {
+  const stdout = error.stdout.trim() || "<empty>"
+  const stderr = error.stderr.trim() || "<empty>"
+  return "Neovim RPC command failed.\n\n" +
+    `Socket: ${error.socket}\n` +
+    `Expression: ${error.expr}\n` +
+    `Exit code: ${error.exitCode}\n\n` +
+    `stdout:\n${stdout}\n\n` +
+    `stderr:\n${stderr}`
+}
+
+const isNvimRpcError = (error: unknown): error is NvimRpcError =>
+  error instanceof Error &&
+  typeof (error as any).socket === "string" &&
+  typeof (error as any).expr === "string" &&
+  typeof (error as any).exitCode === "number"
+
 // --- Plugin ---
 
 export const DiffReviewPlugin: Plugin = async (ctx) => {
@@ -233,10 +302,16 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           "2. Call with action 'get_hunks' to retrieve all change hunks across all files.\n" +
           "   Each hunk includes file path, status, and line range info.\n" +
           "3. Analyze the hunks and decide a review order. Group and reorder them:\n" +
-          "   - GROUP hunks that are in the same file and modify the same function or\n" +
-          "     logical block. Adjacent or nearby hunks (within ~30 lines) in the same\n" +
-          "     file should almost always be grouped together. This is important — without\n" +
-          "     grouping, a function with 3 small changes becomes 3 separate review items.\n" +
+          "   - GROUP hunks that are in the same file and modify the same function, class\n" +
+          "     section, or logical block. Adjacent or nearby hunks (within ~30 lines) in\n" +
+          "     the same file should almost always be grouped together. This is important —\n" +
+          "     without grouping, a function with 3 small changes becomes 3 separate items.\n" +
+          "   - DO NOT group distant file regions by default. If related hunks are far\n" +
+          "     apart (roughly >100-200 lines), prefer separate review items unless they\n" +
+          "     cannot be understood independently. Show helper definitions first, then\n" +
+          "     distant call sites as separate items.\n" +
+          "   - KEEP tests separate from implementation unless they are tiny and adjacent\n" +
+          "     within the same test file.\n" +
           "   - GROUP all import/require changes at the top of a file into one item.\n" +
           "   - REORDER for narrative coherence — e.g. show the data model change before\n" +
           "     the API that uses it, then the UI that calls the API.\n" +
@@ -247,7 +322,10 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           "   fine — just wrap the hunk in an array.\n" +
           "4. Call with action 'start_review' with the ordered groups to open the diff\n" +
           "   view and begin. If you omit the order, natural hunk order is used.\n" +
-          "5. Explain the current item shown in the diff view.\n" +
+          "5. Explain the current item shown in the diff view. Mention relevant line\n" +
+          "   numbers in the explanation so the user can map comments to the diff, e.g.\n" +
+          "   '- Line 18 - updated the function docblock to add the new param' or\n" +
+          "   '- Lines 20-25 - iterate through config before applying changes'.\n" +
           "6. End with a short prompt like: '(n)ext, or do you have questions?'\n" +
           "   This lets the user type just 'n' to continue, or ask a question.\n" +
           "   You MUST wait for the user's response before calling 'next'.\n" +
@@ -327,13 +405,12 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
             ),
         },
         async execute(args, context) {
-          // plugin_version doesn't need Neovim — handle before socket discovery
-          if (args.action === "plugin_version") {
-            return "opencode-nvim-diff-review v0.6.0"
-          }
-
           const socket = await discoverNvimSocket()
           if (!socket) {
+            if (args.action === "plugin_version") {
+              return `OpenCode plugin: v${PLUGIN_VERSION}\nNeovim plugin: unavailable (no Neovim socket found)\nCompatible: unknown`
+            }
+
             return "Could not find a running Neovim instance.\n\n" +
               "The tool looks for Neovim in this order:\n" +
               "1. NVIM_SOCKET environment variable (if set)\n" +
@@ -344,12 +421,87 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
               "  nvim --listen $NVIM_SOCKET"
           }
 
-          const nvimExpr = (expr: string) =>
-            Bun.$`nvim --headless --server ${socket} --remote-expr ${expr}`.text()
+          const nvimExpr = async (expr: string): Promise<string> => {
+            const proc = Bun.spawn(["nvim", "--headless", "--server", socket, "--remote-expr", expr], {
+              stdout: "pipe",
+              stderr: "pipe",
+            })
+            const [stdout, stderr, exitCode] = await Promise.all([
+              new Response(proc.stdout).text(),
+              new Response(proc.stderr).text(),
+              proc.exited,
+            ])
+
+            if (exitCode !== 0) {
+              const error = new Error(`nvim --remote-expr failed with exit code ${exitCode}`) as NvimRpcError
+              error.socket = socket
+              error.expr = expr
+              error.exitCode = exitCode
+              error.stdout = stdout
+              error.stderr = stderr
+              throw error
+            }
+
+            return stdout
+          }
+
+          const getNvimPluginVersion = async (): Promise<string | null> => {
+            try {
+              const type = (await nvimExpr(luaEval("type(DiffviewPluginVersion)"))).trim()
+              if (type !== "function") return null
+              return (await nvimExpr(luaEval("DiffviewPluginVersion()"))).trim()
+            } catch {
+              return null
+            }
+          }
+
+          const checkNvimPlugin = async (): Promise<string | null> => {
+            const requiredGlobals = ["DiffviewState", "DiffviewHunks", "DiffviewGoTo"]
+            const missing: string[] = []
+
+            for (const global of requiredGlobals) {
+              const type = (await nvimExpr(luaEval(`type(${global})`))).trim()
+              if (type !== "function") missing.push(global)
+            }
+
+            if (missing.length > 0) {
+              return "Neovim is reachable, but the diff-review Lua plugin is not loaded.\n\n" +
+                `Socket: ${socket}\n` +
+                `Missing globals: ${missing.join(", ")}\n\n` +
+                "Try restarting Neovim after updating the plugin, or run this in Neovim if the plugin is already in runtimepath:\n" +
+                `:lua require("diff-review").setup()`
+            }
+
+            const nvimVersion = await getNvimPluginVersion()
+            if (!nvimVersion) {
+              return "Neovim is reachable and the diff-review Lua globals are loaded, but the Lua plugin does not expose DiffviewPluginVersion().\n\n" +
+                `OpenCode plugin: v${PLUGIN_VERSION}\n` +
+                "Neovim plugin: older than v0.6.1 or not updated\n\n" +
+                "Please update the Neovim plugin (for lazy.nvim, run :Lazy update) and restart Neovim."
+            }
+
+            if (nvimVersion !== PLUGIN_VERSION) {
+              return "diff-review plugin version mismatch.\n\n" +
+                `OpenCode plugin: v${PLUGIN_VERSION}\n` +
+                `Neovim plugin: v${nvimVersion}\n\n` +
+                "This may still work if the APIs are compatible, but mismatches can cause confusing RPC failures.\n" +
+                "Please update both the npm package and the Neovim plugin to the same version."
+            }
+
+            return null
+          }
+
+          if (args.action === "plugin_version") {
+            const nvimVersion = await getNvimPluginVersion()
+            const compatible = nvimVersion === PLUGIN_VERSION ? "yes" : nvimVersion ? "no" : "unknown"
+            return `OpenCode plugin: v${PLUGIN_VERSION}\n` +
+              `Neovim plugin: ${nvimVersion ? `v${nvimVersion}` : "unavailable or older than v0.6.1"}\n` +
+              `Compatible: ${compatible}`
+          }
 
           const getState = async (): Promise<DiffviewState> => {
             try {
-              const raw = await nvimExpr(`luaeval("DiffviewState()")`)
+              const raw = await nvimExpr(luaEval("DiffviewState()"))
               return JSON.parse(raw.trim())
             } catch {
               return { open: false, error: "Could not query diffview state" }
@@ -357,8 +509,8 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           }
 
           const getHunks = async (ref?: string): Promise<HunkItem[]> => {
-            const luaArg = ref ? `"${ref.replace(/"/g, '\\"')}"` : ""
-            const raw = await nvimExpr(`luaeval("DiffviewHunks(${luaArg})")`)
+            const luaArg = ref ? luaString(ref) : ""
+            const raw = await nvimExpr(luaEval(`DiffviewHunks(${luaArg})`))
             const parsed = JSON.parse(raw.trim())
             if (parsed.error) throw new Error(parsed.error)
             return parsed as HunkItem[]
@@ -366,10 +518,9 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
 
           /** Navigate diffview to show one or more hunks with fold focus. */
           const showHunks = async (hunks: HunkItem[]): Promise<void> => {
-            const file = hunks[0].file.replace(/"/g, '\\"')
             const hunkSpec = buildHunkSpec(hunks)
             const raw = await nvimExpr(
-              `luaeval("DiffviewGoTo('${file}', ${hunkSpec})")`
+              luaEval(`DiffviewGoTo(${luaString(hunks[0].file)}, ${hunkSpec})`)
             )
             const result = JSON.parse(raw.trim())
             if (result.error) throw new Error(result.error)
@@ -385,6 +536,11 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           }
 
           try {
+            if (args.action !== "close") {
+              const preflightError = await checkNvimPlugin()
+              if (preflightError) return preflightError
+            }
+
             switch (args.action) {
               case "get_hunks": {
                 // Store ref/files for later use by start_review
@@ -421,7 +577,7 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
                   const escaped = files.map(f => f.replace(/ /g, "\\ ")).join(" ")
                   cmd += ` -- ${escaped}`
                 }
-                await nvimExpr(`luaeval("vim.cmd('${cmd.replace(/'/g, "''")}')")`)
+                await nvimExpr(luaEval(`vim.cmd(${luaString(cmd)})`))
                 // Give diffview time to populate the file list
                 await Bun.sleep(500)
 
@@ -483,7 +639,8 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
                 return `Started review with ${reviewQueue.length} item${reviewQueue.length === 1 ? "" : "s"}` +
                   (ref ? ` (comparing against ${ref})` : " (uncommitted changes vs HEAD)") +
                   `. ${formatHunkPosition()}` +
-                  formatQueueSummary(reviewQueue)
+                  formatQueueSummary(reviewQueue) +
+                  formatGroupingWarnings(reviewQueue)
               }
 
               case "next": {
@@ -578,7 +735,7 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
               }
 
               case "close": {
-                await nvimExpr(`luaeval("require('diffview').close()")`)
+                await nvimExpr(luaEval(`require("diffview").close()`))
 
                 // Clear review state
                 const itemCount = reviewQueue.length
@@ -594,8 +751,12 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
               }
             }
           } catch (e: any) {
+            if (isNvimRpcError(e)) {
+              return formatRpcError(e)
+            }
+
             return `Failed to control Neovim diff view: ${e.message ?? e}. ` +
-              `Is Neovim running with --listen ${socket} and the diff-review plugin installed?`
+              `Socket: ${socket}`
           }
         },
       }),

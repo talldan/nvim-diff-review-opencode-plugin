@@ -19,6 +19,15 @@
 
 local M = {}
 
+local PLUGIN_VERSION = "0.6.1"
+
+--- Return the Neovim-side diff-review plugin version.
+--- Used by the OpenCode plugin to detect version mismatches between the
+--- TypeScript and Lua halves of the integration.
+function DiffviewPluginVersion()
+  return PLUGIN_VERSION
+end
+
 --- Track which buffers existed before diffview opened.
 --- Used by the cleanup hooks to avoid removing buffers the user had open.
 local pre_diffview_bufs = {}
@@ -484,6 +493,7 @@ function M.setup(opts)
 
   -- Register global functions (already defined at module load,
   -- but this ensures they're available even if the module is lazy-loaded)
+  _G.DiffviewPluginVersion = DiffviewPluginVersion
   _G.DiffviewState = DiffviewState
   _G.DiffviewHunks = DiffviewHunks
   _G.DiffviewGoTo = DiffviewGoTo
