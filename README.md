@@ -7,27 +7,27 @@ An agent-driven guided code review tool for Neovim and [OpenCode](https://openco
 The plugin connects an OpenCode agent to Neovim's [diffview.nvim](https://github.com/sindrets/diffview.nvim) via Neovim's built-in RPC socket. The agent can query all change hunks, reorder them for narrative coherence, open diffs, and navigate between hunks — all while the user interacts via the OpenCode chat.
 
 ```
-┌────────────────────────────┬──────────────────────┐
-│                            │                      │
-│  Neovim showing diff of    │  OpenCode agent:     │
-│  src/store/selectors.js    │                      │
-│  (cursor at hunk 2 of 3)   │  "I added validation  │
-│                            │   for the edge case   │
-│  - old code in red         │   where the block     │
-│  + new code in green       │   name is             │
-│                            │   undefined..."       │
-│                            │                      │
-│                            │  Any questions about  │
-│                            │  this change?         │
-└────────────────────────────┴──────────────────────┘
+┌─────────────────────────────┬───────────────────────────┐
+│                             │                           │
+│  Neovim showing diff of     │  OpenCode agent:          │
+│  src/utils/validation.ts    │                           │
+│  (item 3 of 12)            │  "I added a null check    │
+│                             │   before accessing the    │
+│  - old code in red          │   user property, since    │
+│  + new code in green        │   it can be undefined     │
+│                             │   after logout..."        │
+│                             │                           │
+│                             │  Any questions about      │
+│                             │  this change?             │
+└─────────────────────────────┴───────────────────────────┘
 ```
 
 The review workflow:
 
 1. Agent queries all change hunks across all files
-2. Agent decides a review order — reordering for narrative coherence (e.g., data model first, then API, then UI) or using natural order for small changes
+2. Agent groups nearby hunks and decides a review order — reordering for narrative coherence (e.g., data model first, then API, then UI)
 3. Agent opens the diff view and begins the review walk-through
-4. For each hunk: agent explains the change, user asks questions or leaves feedback
+4. For each item: agent explains the change, user asks questions or leaves feedback
 5. Agent notes feedback but **does not edit files** during the review
 6. After the last hunk, agent closes the diff view
 7. Agent proposes a commit message and commits the original work
