@@ -115,6 +115,7 @@ const discoverNvimSocket = async (): Promise<string | null> => {
 
 // --- Helpers ---
 
+/** Maps git status letters to human-readable labels. */
 const STATUS_LABELS: Record<string, string> = {
   M: "modified",
   A: "added",
@@ -122,11 +123,13 @@ const STATUS_LABELS: Record<string, string> = {
   R: "renamed",
   C: "copied",
   T: "type-changed",
+  U: "unmerged",
 }
 
 const statusLabel = (status: string | undefined): string =>
-  (status && STATUS_LABELS[status]) ?? "changed"
+  (status ? STATUS_LABELS[status] : undefined) ?? "changed"
 
+/** Format a human-readable description of the current review position. */
 const formatHunkPosition = (): string => {
   if (reviewQueue.length === 0) return "No review in progress."
   const item = reviewQueue[reviewPosition]
@@ -301,24 +304,17 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
               "Omit to include all uncommitted changes."
             ),
           order: tool.schema
-            .array(
-              tool.schema.array(
-                tool.schema.object({
-                  file: tool.schema.string().describe("Repo-relative file path"),
-                  old_start: tool.schema.number().describe("Start line in old version"),
-                  old_count: tool.schema.number().describe("Line count in old version"),
-                  new_start: tool.schema.number().describe("Start line in new version"),
-                  new_count: tool.schema.number().describe("Line count in new version"),
-                })
-              )
-            )
+            .string()
             .optional()
             .describe(
-              "Custom review order (start_review only). Array of groups, where each group " +
-              "is an array of hunks to show together as one review item. Hunks within a " +
-              "group must be in the same file. Single-hunk groups are fine: [[hunk1], [hunk2]]. " +
-              "To group nearby hunks: [[hunk1, hunk2], [hunk3]]. " +
-              "Each hunk needs: file, old_start, old_count, new_start, new_count. " +
+              "Custom review order (start_review only). A JSON string encoding an array " +
+              "of groups, where each group is an array of hunks to show together as one " +
+              "review item. Hunks within a group must be in the same file.\n" +
+              "Format: '[[{hunk1}, {hunk2}], [{hunk3}]]'\n" +
+              "Each hunk object needs: file (string), old_start (number), old_count (number), " +
+              "new_start (number), new_count (number) — matching values from get_hunks.\n" +
+              "Single-hunk groups are fine: '[[{hunk1}], [{hunk2}]]'.\n" +
+              "To group nearby hunks: '[[{hunk1}, {hunk2}], [{hunk3}]]'.\n" +
               "Omit to use the natural hunk order (each hunk as its own item)."
             ),
         },
@@ -418,12 +414,21 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
 
                 // Build the review queue
                 if (args.order && args.order.length > 0) {
-                  // Agent provided grouped order — resolve each group
+                  // Agent provided grouped order as a JSON string — parse and resolve
+                  let parsedOrder: { file: string; old_start: number; old_count: number; new_start: number; new_count: number }[][]
+                  try {
+                    parsedOrder = JSON.parse(args.order)
+                    if (!Array.isArray(parsedOrder)) throw new Error("order must be an array of groups")
+                  } catch (e: any) {
+                    return `Failed to parse order JSON: ${e.message}. ` +
+                      "Expected format: '[[{file, old_start, old_count, new_start, new_count}, ...], ...]'"
+                  }
+
                   const allHunks = await getHunks(ref)
                   const queue: ReviewItem[] = []
                   const unmatched: string[] = []
 
-                  for (const group of args.order) {
+                  for (const group of parsedOrder) {
                     const resolvedHunks: HunkItem[] = []
                     for (const orderItem of group) {
                       const match = findHunk(allHunks, orderItem)
