@@ -131,9 +131,10 @@ const formatHunkPosition = (): string => {
   if (reviewQueue.length === 0) return "No review in progress."
   const item = reviewQueue[reviewPosition]
   const hunkCount = item.hunks.length
+  const totalHunks = reviewQueue.reduce((sum, r) => sum + r.hunks.length, 0)
   const fileCount = new Set(reviewQueue.map(r => r.file)).size
   const visibleCount = visibleTo - visibleFrom + 1
-  let msg = `Reviewing: ${item.file} (${statusLabel(item.status)}) — item ${reviewPosition + 1} of ${reviewQueue.length} across ${fileCount} file${fileCount === 1 ? "" : "s"}.`
+  let msg = `Reviewing: ${item.file} (${statusLabel(item.status)}) — item ${reviewPosition + 1} of ${reviewQueue.length} across ${fileCount} file${fileCount === 1 ? "" : "s"} (${totalHunks} total hunks).`
   if (hunkCount > 1) {
     msg += ` (${hunkCount} hunks grouped)`
   }
@@ -161,9 +162,10 @@ const findHunk = (
   )
 
 /**
- * Format a summary of the files covered in the review queue.
+ * Format a summary of the files and items covered in the review queue.
  */
 const formatQueueSummary = (queue: ReviewItem[]): string => {
+  const totalHunks = queue.reduce((sum, r) => sum + r.hunks.length, 0)
   const fileGroups = new Map<string, { status: string; count: number; hunkCount: number }>()
   for (const item of queue) {
     const existing = fileGroups.get(item.file)
@@ -177,11 +179,12 @@ const formatQueueSummary = (queue: ReviewItem[]): string => {
   const lines = Array.from(fileGroups.entries()).map(
     ([file, { status, count, hunkCount }]) => {
       const itemLabel = `${count} item${count === 1 ? "" : "s"}`
-      const hunkLabel = hunkCount !== count ? ` (${hunkCount} hunks)` : ""
-      return `  ${file} (${statusLabel(status)}) — ${itemLabel}${hunkLabel}`
+      const hunkDetail = hunkCount !== count ? `, ${hunkCount} hunks` : ""
+      return `  ${file} (${statusLabel(status)}) — ${itemLabel}${hunkDetail}`
     }
   )
-  return `\nFiles in review:\n${lines.join("\n")}`
+  const header = `\nReview: ${queue.length} items, ${totalHunks} hunks across ${fileGroups.size} file${fileGroups.size === 1 ? "" : "s"}:`
+  return `${header}\n${lines.join("\n")}`
 }
 
 /**
@@ -236,9 +239,9 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           "     the API that uses it, then the UI that calls the API.\n" +
           "   - FILTER OUT hunks that are trivial (e.g. whitespace-only changes).\n" +
           "   - Aim for roughly 10-20 review items even for large diffs.\n" +
-          "   Use the 'group' field in the order array to group hunks: hunks with the same\n" +
-          "   group number are shown together as one review item. Ungrouped hunks (no group\n" +
-          "   field) each become their own item.\n" +
+          "   The 'order' parameter accepts an array of groups. Each group is an array of\n" +
+          "   hunks that will be shown together as one review item. Single-hunk groups are\n" +
+          "   fine — just wrap the hunk in an array.\n" +
           "4. Call with action 'start_review' with the ordered groups to open the diff\n" +
           "   view and begin. If you omit the order, natural hunk order is used.\n" +
           "5. Explain the current item shown in the diff view.\n" +
@@ -299,27 +302,22 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
             ),
           order: tool.schema
             .array(
-              tool.schema.object({
-                file: tool.schema.string().describe("Repo-relative file path"),
-                old_start: tool.schema.number().describe("Start line in old version"),
-                old_count: tool.schema.number().describe("Line count in old version"),
-                new_start: tool.schema.number().describe("Start line in new version"),
-                new_count: tool.schema.number().describe("Line count in new version"),
-                group: tool.schema.number().optional().describe(
-                  "Group number (0-indexed). Hunks with the same group number are shown " +
-                  "together as one review item. Hunks in a group must be in the same file. " +
-                  "Omit or use unique values for ungrouped hunks."
-                ),
-              })
+              tool.schema.array(
+                tool.schema.object({
+                  file: tool.schema.string().describe("Repo-relative file path"),
+                  old_start: tool.schema.number().describe("Start line in old version"),
+                  old_count: tool.schema.number().describe("Line count in old version"),
+                  new_start: tool.schema.number().describe("Start line in new version"),
+                  new_count: tool.schema.number().describe("Line count in new version"),
+                })
+              )
             )
             .optional()
             .describe(
-              "Custom review order (start_review only). Array of hunk identifiers " +
-              "from the get_hunks response. Use the 'group' field to group hunks that " +
-              "should be shown together (e.g. multiple changes within one function). " +
-              "Hunks with the same group number become one review item. " +
-              "Example: [{...hunk1, group: 0}, {...hunk2, group: 0}, {...hunk3, group: 1}] " +
-              "creates 2 review items: hunk1+hunk2 together, then hunk3. " +
+              "Custom review order (start_review only). Array of groups, where each group " +
+              "is an array of hunks to show together as one review item. Hunks within a " +
+              "group must be in the same file. Single-hunk groups are fine: [[hunk1], [hunk2]]. " +
+              "To group nearby hunks: [[hunk1, hunk2], [hunk3]]. " +
               "Each hunk needs: file, old_start, old_count, new_start, new_count. " +
               "Omit to use the natural hunk order (each hunk as its own item)."
             ),
@@ -420,47 +418,34 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
 
                 // Build the review queue
                 if (args.order && args.order.length > 0) {
-                  // Agent provided order with optional group numbers
+                  // Agent provided grouped order — resolve each group
                   const allHunks = await getHunks(ref)
+                  const queue: ReviewItem[] = []
                   const unmatched: string[] = []
 
-                  // Resolve each order item to an actual hunk
-                  const resolved: { hunk: HunkItem; group?: number }[] = []
-                  for (const orderItem of args.order) {
-                    const match = findHunk(allHunks, orderItem)
-                    if (match) {
-                      resolved.push({ hunk: match, group: orderItem.group })
-                    } else {
-                      unmatched.push(`${orderItem.file} ${orderItem.old_start}→${orderItem.new_start}`)
+                  for (const group of args.order) {
+                    const resolvedHunks: HunkItem[] = []
+                    for (const orderItem of group) {
+                      const match = findHunk(allHunks, orderItem)
+                      if (match) {
+                        resolvedHunks.push(match)
+                      } else {
+                        unmatched.push(`${orderItem.file} ${orderItem.old_start}→${orderItem.new_start}`)
+                      }
+                    }
+                    if (resolvedHunks.length > 0) {
+                      queue.push({
+                        file: resolvedHunks[0].file,
+                        status: resolvedHunks[0].status,
+                        hunks: resolvedHunks,
+                      })
                     }
                   }
 
-                  if (resolved.length === 0) {
+                  if (queue.length === 0) {
                     return "Could not match any items in the provided order to actual hunks. " +
                       `Unmatched: ${unmatched.join(", ")}. ` +
                       "Call 'get_hunks' to see available hunks."
-                  }
-
-                  // Build review items by grouping consecutive items with the same group number.
-                  // Items without a group number each become their own review item.
-                  const queue: ReviewItem[] = []
-                  let currentGroup: number | undefined = undefined
-                  let currentItem: ReviewItem | null = null
-
-                  for (const { hunk, group } of resolved) {
-                    if (group !== undefined && group === currentGroup && currentItem) {
-                      // Same group — add to current item
-                      currentItem.hunks.push(hunk)
-                    } else {
-                      // New group or ungrouped — start a new review item
-                      currentItem = {
-                        file: hunk.file,
-                        status: hunk.status,
-                        hunks: [hunk],
-                      }
-                      queue.push(currentItem)
-                      currentGroup = group
-                    }
                   }
 
                   reviewQueue = queue
