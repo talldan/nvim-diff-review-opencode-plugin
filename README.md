@@ -57,10 +57,11 @@ An OpenCode plugin that registers a `diff_review` tool the AI agent uses to cont
 | `get_hunks` | Get all diff hunks across all files as a flat array. Each hunk is self-contained with file path, status, and line ranges. Optionally scoped to specific files or a git ref. |
 | `start_review` | Open the diff view and begin the review walk-through. Accepts an optional array of groups (each group is an array of hunks to show together). If omitted, uses natural hunk order with each hunk as its own item. |
 | `next` | Navigate to the next item in the review queue. Prevents wrap-around at the last item. |
-| `prev` | Navigate to the previous item in the review queue. Prevents wrap-around at the first item. |
+| `prev` | Navigate to the previous item in the review queue. If `include_next` expanded the view, first collapses back to the current item before going back. Prevents wrap-around at the first item. |
 | `include_next` | Expand the visible area to also show the next item alongside the current one. Items must be in the same file. The pointer advances, so `next` after `include_next` skips the already-shown item. `prev` goes back and shows just that single item. |
 | `status` | Get current position in the review queue without navigating. |
 | `close` | Close the diff view and clear the review queue. |
+| `plugin_version` | Return the plugin version for diagnostics. Does not require Neovim. |
 
 ## Dependencies
 
@@ -190,6 +191,7 @@ The Lua (Neovim) side is stateless — it provides functions to query hunks and 
 - **Buffer cleanup on close**: diffview.nvim intentionally keeps local file buffers open after closing (so you can continue editing). The plugin tracks which buffers existed before the review and removes any new ones on close — unless they have unsaved edits.
 - **Async cursor positioning**: `DiffviewGoTo` stores a pending target and applies it via a `DiffviewDiffBufWinEnter` autocmd + `vim.defer_fn`. This ensures the cursor is positioned after diffview's async `set_file` completes (which resets cursor to line 1 on `file_open_new`).
 - **Socket auto-discovery**: When `NVIM_SOCKET` is not set, the tool scans `$TMPDIR/nvim.$USER/` and `/tmp` for Neovim socket files, verifies each is live, and uses `lsof` to match the Neovim process's working directory against the current project. This allows zero-configuration usage in ad-hoc terminals — just run `nvim` and OpenCode will find it.
+- **Line wrapping**: Diff windows have `wrap` enabled during hunk focus so long lines are fully visible without horizontal scrolling.
 
 ### Review workflow instructions
 
