@@ -196,7 +196,7 @@ const formatQueueSummary = (queue: ReviewItem[]): string => {
  */
 const collectVisibleHunks = (queue: ReviewItem[], fromIdx: number, toIdx: number): HunkItem[] => {
   const hunks: HunkItem[] = []
-  for (let i = fromIdx; i <= toIdx; i++) {
+  for (let i = fromIdx; i <= Math.min(toIdx, queue.length - 1); i++) {
     hunks.push(...queue[i].hunks)
   }
   return hunks
@@ -278,7 +278,7 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           "to re-orient if you lose track.",
         args: {
           action: tool.schema
-            .enum(["get_hunks", "start_review", "next", "prev", "include_next", "status", "close"])
+            .enum(["get_hunks", "start_review", "next", "prev", "include_next", "status", "close", "plugin_version"])
             .describe(
               "get_hunks: retrieve all diff hunks across all files as a flat array. " +
               "start_review: open the diff view and begin reviewing, optionally with a custom order. " +
@@ -286,7 +286,8 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
               "prev: navigate to the previous item in the review queue. " +
               "include_next: expand the visible area to also show the next item alongside the current one (items must be in the same file). " +
               "status: get current position in the review queue without navigating. " +
-              "close: close the diff view and end the review."
+              "close: close the diff view and end the review. " +
+              "plugin_version: return the plugin version for diagnostics."
             ),
           ref: tool.schema
             .string()
@@ -304,21 +305,33 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
               "Omit to include all uncommitted changes."
             ),
           order: tool.schema
-            .string()
+            .array(
+              tool.schema.array(
+                tool.schema.object({
+                  file: tool.schema.string().describe("Repo-relative file path"),
+                  old_start: tool.schema.number().describe("Start line in old version"),
+                  old_count: tool.schema.number().describe("Line count in old version"),
+                  new_start: tool.schema.number().describe("Start line in new version"),
+                  new_count: tool.schema.number().describe("Line count in new version"),
+                })
+              )
+            )
             .optional()
             .describe(
-              "Custom review order (start_review only). A JSON string encoding an array " +
-              "of groups, where each group is an array of hunks to show together as one " +
-              "review item. Hunks within a group must be in the same file.\n" +
-              "Format: '[[{hunk1}, {hunk2}], [{hunk3}]]'\n" +
-              "Each hunk object needs: file (string), old_start (number), old_count (number), " +
-              "new_start (number), new_count (number) — matching values from get_hunks.\n" +
-              "Single-hunk groups are fine: '[[{hunk1}], [{hunk2}]]'.\n" +
-              "To group nearby hunks: '[[{hunk1}, {hunk2}], [{hunk3}]]'.\n" +
+              "Custom review order (start_review only). Array of groups, where each group " +
+              "is an array of hunks to show together as one review item. Hunks within a " +
+              "group must be in the same file. Single-hunk groups are fine: [[hunk1], [hunk2]]. " +
+              "To group nearby hunks: [[hunk1, hunk2], [hunk3]]. " +
+              "Each hunk needs: file, old_start, old_count, new_start, new_count. " +
               "Omit to use the natural hunk order (each hunk as its own item)."
             ),
         },
         async execute(args, context) {
+          // plugin_version doesn't need Neovim — handle before socket discovery
+          if (args.action === "plugin_version") {
+            return "opencode-nvim-diff-review v0.6.0"
+          }
+
           const socket = await discoverNvimSocket()
           if (!socket) {
             return "Could not find a running Neovim instance.\n\n" +
@@ -414,21 +427,12 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
 
                 // Build the review queue
                 if (args.order && args.order.length > 0) {
-                  // Agent provided grouped order as a JSON string — parse and resolve
-                  let parsedOrder: { file: string; old_start: number; old_count: number; new_start: number; new_count: number }[][]
-                  try {
-                    parsedOrder = JSON.parse(args.order)
-                    if (!Array.isArray(parsedOrder)) throw new Error("order must be an array of groups")
-                  } catch (e: any) {
-                    return `Failed to parse order JSON: ${e.message}. ` +
-                      "Expected format: '[[{file, old_start, old_count, new_start, new_count}, ...], ...]'"
-                  }
 
                   const allHunks = await getHunks(ref)
                   const queue: ReviewItem[] = []
                   const unmatched: string[] = []
 
-                  for (const group of parsedOrder) {
+                  for (const group of args.order) {
                     const resolvedHunks: HunkItem[] = []
                     for (const orderItem of group) {
                       const match = findHunk(allHunks, orderItem)
@@ -506,6 +510,15 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
               case "prev": {
                 if (reviewQueue.length === 0) {
                   return "No review in progress. Call 'start_review' first."
+                }
+
+                // If include_next expanded the visible range, first collapse back
+                // to just the first item in the range.
+                if (visibleTo > visibleFrom) {
+                  reviewPosition = visibleFrom
+                  visibleTo = visibleFrom
+                  await showCurrentVisible()
+                  return `Collapsed to single item. ${formatHunkPosition()}`
                 }
 
                 // Go back one item before the current visible range
