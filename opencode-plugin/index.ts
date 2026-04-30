@@ -242,10 +242,13 @@ export const DiffReviewPlugin: Plugin = async (ctx) => {
           "4. Call with action 'start_review' with the ordered groups to open the diff\n" +
           "   view and begin. If you omit the order, natural hunk order is used.\n" +
           "5. Explain the current item shown in the diff view.\n" +
-          "6. Ask the user if they have questions or feedback about these changes.\n" +
+          "6. End with a short prompt like: '(n)ext, or do you have questions?'\n" +
+          "   This lets the user type just 'n' to continue, or ask a question.\n" +
+          "   You MUST wait for the user's response before calling 'next'.\n" +
+          "   Never auto-advance through the review unless the user requests it.\n" +
           "7. If the user requests changes or leaves feedback, acknowledge it and note it\n" +
           "   down — but DO NOT make any changes yet. Continue the review.\n" +
-          "8. Call with action 'next' to advance to the next item in the review queue.\n" +
+          "8. When the user says 'next', 'n', or similar, call 'next' to advance.\n" +
           "   When you reach the last item, 'next' will tell you there are no more items.\n" +
           "   Alternatively, use 'include_next' to expand the visible area to also show\n" +
           "   the next item — useful when adjacent items are closely related and benefit\n" +
